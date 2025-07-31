@@ -207,11 +207,26 @@ static void os_write(os *ctx, i32 fd, s8 s)
     }
 }
 
-#if 0
+static i32 os_read(os *ctx, i32 fd, u8 *buf, i32 len)
+{
+    assert(fd >= 0 && fd <= 3);
+    if (ctx->handles[fd].err) return -1;
+    
+    i32 bytesRead = 0;
+    if (!ReadFile(ctx->handles[fd].h, buf, len, &bytesRead, 0)) {
+        ctx->handles[fd].err = 1;
+        return -1;
+    }
+    return bytesRead;
+}
+
+#if 1
 __attribute((force_align_arg_pointer))
 void mainCRTStartup(void) {
     os ctx[1] = {0};
     i32 dummy;
+    ctx->handles[0].h         = GetStdHandle(STD_INPUT_HANDLE);
+    ctx->handles[0].isconsole = GetConsoleMode(ctx->handles[0].h, &dummy);
     ctx->handles[1].h         = GetStdHandle(STD_OUTPUT_HANDLE);
     ctx->handles[1].isconsole = GetConsoleMode(ctx->handles[1].h, &dummy);
     ctx->handles[2].h         = GetStdHandle(STD_ERROR_HANDLE);

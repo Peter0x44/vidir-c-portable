@@ -93,6 +93,7 @@ static b32 startswith(s8 s, s8 prefix)
 }
 
 static void os_write(os *, i32 fd, s8);
+static i32  os_read(os *, i32 fd, u8 *, i32);
 
 typedef struct {
     arena *perm;
@@ -145,6 +146,101 @@ static void prints8(u8buf *b, s8 s)
     }
 }
 
+// Input buffer for reading from stdin
+typedef struct {
+    arena *perm;
+    os    *ctx;
+    u8    *buf;
+    iz     len;
+    iz     cap;
+    iz     pos;
+    i32    fd;
+    b32    eof;
+} u8input;
+
+static u8input *newinput(arena *perm, i32 fd, iz cap)
+{
+    u8input *b = new(perm, u8input, 1);
+    b->perm = perm;
+    b->cap = cap;
+    b->buf = new(perm, u8, cap);
+    b->fd  = fd;
+    b->ctx = perm->ctx;
+    return b;
+}
+
+static void refill(u8input *b)
+{
+    if (b->eof) return;
+    
+    // Move remaining data to beginning of buffer
+    if (b->pos < b->len) {
+        iz remaining = b->len - b->pos;
+        for (iz i = 0; i < remaining; i++) {
+            b->buf[i] = b->buf[b->pos + i];
+        }
+        b->len = remaining;
+    } else {
+        b->len = 0;
+    }
+    b->pos = 0;
+    
+    // Read more data
+    iz space = b->cap - b->len;
+    if (space > 0) {
+        i32 n = os_read(b->ctx, b->fd, b->buf + b->len, (i32)space);
+        if (n <= 0) {
+            b->eof = 1;
+        } else {
+            b->len += n;
+        }
+    }
+}
+
+// Read next line from input, returns empty string on EOF
+static s8 nextline(u8input *b)
+{
+    while (!b->eof) {
+        // Look for newline in current buffer
+        for (iz i = b->pos; i < b->len; i++) {
+            if (b->buf[i] == '\n') {
+                iz line_len = i - b->pos;
+                s8 line = {b->buf + b->pos, line_len};
+                b->pos = i + 1;  // Skip the newline
+                return line;
+            }
+        }
+        
+        // No newline found, need more data
+        if (b->pos > 0) {
+            refill(b);
+        } else if (b->len == b->cap) {
+            // Buffer full but no newline - allocate larger buffer
+            iz new_cap = b->cap * 2;
+            u8 *new_buf = new(b->perm, u8, new_cap);
+            for (iz i = 0; i < b->len; i++) {
+                new_buf[i] = b->buf[i];
+            }
+            b->buf = new_buf;
+            b->cap = new_cap;
+            refill(b);
+        } else {
+            refill(b);
+        }
+    }
+    
+    // EOF reached, return any remaining data as final line
+    if (b->pos < b->len) {
+        s8 line = {b->buf + b->pos, b->len - b->pos};
+        b->pos = b->len;
+        return line;
+    }
+    
+    // No more data
+    s8 empty = {0};
+    return empty;
+}
+
 static void vidir(config *);
 
 static void vidir(config *conf)
@@ -157,12 +253,11 @@ static void vidir(config *conf)
     u8buf *out = newfdbuf(perm, 1, 4096);  // stdout
     u8buf *err = newfdbuf(perm, 2, 4096);  // stderr
     
-    // Convert all args to s8 format 
+    // Simple growing array of file paths
     s8 *paths = 0;
     i32 paths_count = 0;
 
     if (conf->nargs > 0) {
-        paths = new(perm, s8, conf->nargs);
         for (i32 i = 0; i < conf->nargs; i++) {
             s8 arg = s8fromcstr(conf->args[i]);
             if (s8equals(arg, S("-"))) {
@@ -180,17 +275,70 @@ static void vidir(config *conf)
                     assert(0 && "Unknown option: TODO exit");
                 }
             } else {
-                paths[paths_count++] = arg;
+                // Reallocate paths array with one more slot
+                s8 *new_paths = new(perm, s8, paths_count + 1);
+                for (i32 j = 0; j < paths_count; j++) {
+                    new_paths[j] = paths[j];
+                }
+                new_paths[paths_count] = arg;
+                paths = new_paths;
+                paths_count++;
             }
         }
     }
 
-    // Print final results
-    // TODO: Remove this debug output when implementation is complete
-    prints8(out, S("vidir: args_count="));
-    // TODO: Need number printing functions like u-config
-    prints8(out, S("TODO"));
-    prints8(out, S("\n"));
+    // Read from stdin if requested
+    if (read_from_stdin) {
+        u8input *input = newinput(perm, 0, 4096);  // stdin
+        
+        for (;;) {
+            s8 line = nextline(input);
+            if (line.len == 0 && line.s == 0) break;  // EOF (null pointer)
+            
+            // Trim trailing whitespace (including \r if present)
+            while (line.len > 0 && (line.s[line.len-1] == ' ' || 
+                                   line.s[line.len-1] == '\t' ||
+                                   line.s[line.len-1] == '\r')) {
+                line.len--;
+            }
+            
+            if (line.len == 0) continue;  // Skip empty lines
+            
+            // Make a copy of the line in permanent memory
+            u8 *line_copy = new(perm, u8, line.len);
+            for (iz j = 0; j < line.len; j++) {
+                line_copy[j] = line.s[j];
+            }
+            s8 path = {line_copy, line.len};
+            
+            // Reallocate paths array with one more slot
+            s8 *new_paths = new(perm, s8, paths_count + 1);
+            for (i32 j = 0; j < paths_count; j++) {
+                new_paths[j] = paths[j];
+            }
+            new_paths[paths_count] = path;
+            paths = new_paths;
+            paths_count++;
+        }
+    }
+
+    // Print debug output showing what we collected
+    prints8(out, S("vidir: collected "));
+    // TODO: Add a number printing function
+    if (paths_count < 10) {
+        prints8(out, (s8){(u8*)"0123456789" + paths_count, 1});
+    } else {
+        prints8(out, S("many"));
+    }
+    prints8(out, S(" paths\n"));
+    
+    if (verbose) {
+        for (i32 i = 0; i < paths_count; i++) {
+            prints8(out, S("  "));
+            prints8(out, paths[i]);
+            prints8(out, S("\n"));
+        }
+    }
     
     flush(out);
     flush(err);
