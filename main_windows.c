@@ -203,17 +203,8 @@ static s8 fromenv_(arena *perm, c16 *name)
     c16 *wbuf = new(perm, c16, wlen);
     GetEnvironmentVariableW(name, wbuf, wlen);
     
-    i32 len = WideCharToMultiByte(CP_UTF8, 0, wbuf, wlen - 1, 0, 0, 0, 0);
-    if (!len) {
-        s8 r = {0};
-        return r;
-    }
-    
-    u8 *buf = new(perm, u8, len);
-    WideCharToMultiByte(CP_UTF8, 0, wbuf, wlen - 1, buf, len, 0, 0);
-    
-    s8 r = {buf, len};
-    return r;
+    s16 wide = {wbuf, wlen - 1};  // Exclude null terminator
+    return fromwide_(perm, wide);
 }
 
 static config *newconfig_(os *ctx)
