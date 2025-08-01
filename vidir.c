@@ -313,6 +313,7 @@ static void vidir(config *conf)
     s8 *paths = 0;
     i32 paths_count = 0;
 
+    // First pass: collect all path arguments (don't expand directories yet)
     if (conf->nargs > 0) {
         for (i32 i = 0; i < conf->nargs; i++) {
             s8 arg = s8fromcstr(conf->args[i]);
@@ -331,49 +332,23 @@ static void vidir(config *conf)
                     assert(0 && "Unknown option: TODO exit");
                 }
             } else {
-                if (os_path_is_dir(perm->ctx, arg)) {
-                    // Expand directory contents
-                    s8node *entries = os_list_dir(perm->ctx, perm, arg);
-                    entries = s8sort_(entries);  // Sort directory listings
-                    while (entries) {
-                        // Reallocate paths array with one more slot
-                        s8 *new_paths = new(perm, s8, paths_count + 1);
-                        for (i32 j = 0; j < paths_count; j++) {
-                            new_paths[j] = paths[j];
-                        }
-                        new_paths[paths_count] = entries->str;
-                        paths = new_paths;
-                        paths_count++;
-                        entries = entries->next;
-                    }
-                } else {
-                    // Regular file, add as-is
-                    s8 *new_paths = new(perm, s8, paths_count + 1);
-                    for (i32 j = 0; j < paths_count; j++) {
-                        new_paths[j] = paths[j];
-                    }
-                    new_paths[paths_count] = arg;
-                    paths = new_paths;
-                    paths_count++;
+                // Add path as-is, we'll expand directories later
+                s8 *new_paths = new(perm, s8, paths_count + 1);
+                for (i32 j = 0; j < paths_count; j++) {
+                    new_paths[j] = paths[j];
                 }
+                new_paths[paths_count] = arg;
+                paths = new_paths;
+                paths_count++;
             }
         }
     } else {
         // No arguments provided, default to current directory
         s8 current_dir = S(".");
-        s8node *entries = os_list_dir(perm->ctx, perm, current_dir);
-        entries = s8sort_(entries);  // Sort directory listings
-        while (entries) {
-            // Reallocate paths array with one more slot
-            s8 *new_paths = new(perm, s8, paths_count + 1);
-            for (i32 j = 0; j < paths_count; j++) {
-                new_paths[j] = paths[j];
-            }
-            new_paths[paths_count] = entries->str;
-            paths = new_paths;
-            paths_count++;
-            entries = entries->next;
-        }
+        s8 *new_paths = new(perm, s8, paths_count + 1);
+        new_paths[0] = current_dir;
+        paths = new_paths;
+        paths_count = 1;
     }
 
     // Read from stdin if requested
@@ -410,6 +385,42 @@ static void vidir(config *conf)
             paths_count++;
         }
     }
+
+    // Now expand any directories in the collected paths
+    s8 *final_paths = 0;
+    i32 final_count = 0;
+    
+    for (i32 i = 0; i < paths_count; i++) {
+        if (os_path_is_dir(perm->ctx, paths[i])) {
+            // Expand directory contents
+            s8node *entries = os_list_dir(perm->ctx, perm, paths[i]);
+            entries = s8sort_(entries);  // Sort directory listings
+            while (entries) {
+                // Reallocate final_paths array with one more slot
+                s8 *new_final = new(perm, s8, final_count + 1);
+                for (i32 j = 0; j < final_count; j++) {
+                    new_final[j] = final_paths[j];
+                }
+                new_final[final_count] = entries->str;
+                final_paths = new_final;
+                final_count++;
+                entries = entries->next;
+            }
+        } else {
+            // Regular file, add as-is
+            s8 *new_final = new(perm, s8, final_count + 1);
+            for (i32 j = 0; j < final_count; j++) {
+                new_final[j] = final_paths[j];
+            }
+            new_final[final_count] = paths[i];
+            final_paths = new_final;
+            final_count++;
+        }
+    }
+    
+    // Use the expanded paths
+    paths = final_paths;
+    paths_count = final_count;
 
     // Print debug output showing what we collected
     prints8(out, S("vidir: collected "));
