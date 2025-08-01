@@ -148,9 +148,10 @@ static s8node *s8sort_(s8node *head)
 
 static void os_write(os *, i32 fd, s8);
 static i32  os_read(os *, i32 fd, u8 *, i32);
-static b32  os_path_is_dir(os *, s8 path);
-static s8node *os_list_dir(os *, arena *, s8 path);
-static s8   os_get_temp_file(os *, arena *);
+static b32  os_path_is_dir(arena, s8 path);
+static s8node *os_list_dir(arena *, s8 path);
+static s8    os_get_temp_file(arena *);
+static b32  os_open_file_for_write(os *, s8 path);
 
 typedef struct {
     arena *perm;
@@ -394,9 +395,9 @@ static void vidir(config *conf)
     i32 final_count = 0;
     
     for (i32 i = 0; i < paths_count; i++) {
-        if (os_path_is_dir(perm->ctx, paths[i])) {
+        if (os_path_is_dir(*perm, paths[i])) {
             // Expand directory contents
-            s8node *entries = os_list_dir(perm->ctx, perm, paths[i]);
+            s8node *entries = os_list_dir(perm, paths[i]);
             entries = s8sort_(entries);  // Sort directory listings
             while (entries) {
                 // Reallocate final_paths array with one more slot

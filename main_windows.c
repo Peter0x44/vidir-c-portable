@@ -13,7 +13,25 @@ typedef struct {
     c32 rune;
 } utf8;
 
+typedef struct {
+    c16 *s;
+    iz   len;
+} s16;
+
+typedef struct {
+    s16 tail;
+    c32 rune;
+} utf16;
+
 static s8 cuthead(s8 s, iz off) {
+    assert(off <= s.len);
+    s.s += off;
+    s.len -= off;
+    return s;
+}
+
+static s16 s16cuthead_(s16 s, iz off) {
+    assert(off >= 0);
     assert(off <= s.len);
     s.s += off;
     s.len -= off;
@@ -77,6 +95,77 @@ static i32 utf16encode_(c16 *dst, c32 rune)
     }
     dst[0] = (c16)rune;
     return 1;
+}
+
+// Encode code point returning the output length (1-4).
+static i32 utf8encode_(u8 *s, c32 rune)
+{
+    if (rune<0 || (rune>=0xd800 && rune<=0xdfff) || rune>0x10ffff) {
+        rune = REPLACEMENT_CHARACTER;
+    }
+    switch ((rune >= 0x80) + (rune >= 0x800) + (rune >= 0x10000)) {
+    case 0: s[0] = (u8)(0x00 | ((rune >>  0)     )); return 1;
+    case 1: s[0] = (u8)(0xc0 | ((rune >>  6)     ));
+            s[1] = (u8)(0x80 | ((rune >>  0) & 63)); return 2;
+    case 2: s[0] = (u8)(0xe0 | ((rune >> 12)     ));
+            s[1] = (u8)(0x80 | ((rune >>  6) & 63));
+            s[2] = (u8)(0x80 | ((rune >>  0) & 63)); return 3;
+    case 3: s[0] = (u8)(0xf0 | ((rune >> 18)     ));
+            s[1] = (u8)(0x80 | ((rune >> 12) & 63));
+            s[2] = (u8)(0x80 | ((rune >>  6) & 63));
+            s[3] = (u8)(0x80 | ((rune >>  0) & 63)); return 4;
+    }
+    assert(0);
+}
+
+static utf16 utf16decode_(s16 s)
+{
+    assert(s.len);
+    utf16 r = {0};
+    r.rune = s.s[0];
+    if (r.rune>=0xdc00 && r.rune<=0xdfff) {
+        goto reject;  // unpaired low surrogate
+    } else if (r.rune>=0xd800 && r.rune<=0xdbff) {
+        if (s.len < 2) {
+            goto reject;  // missing low surrogate
+        }
+        i32 hi = r.rune;
+        i32 lo = s.s[1];
+        if (lo<0xdc00 || lo>0xdfff) {
+            goto reject;  // expected low surrogate
+        }
+        r.rune = 0x10000 + ((hi - 0xd800)<<10) + (lo - 0xdc00);
+        r.tail = s16cuthead_(s, 2);
+        return r;
+    }
+    r.tail = s16cuthead_(s, 1);
+    return r;
+
+    reject:
+    r.rune = REPLACEMENT_CHARACTER;
+    r.tail = s16cuthead_(s, 1);
+    return r;
+}
+
+static s8 fromwide_(arena *perm, s16 w)
+{
+    iz len = 0;
+    utf16 state = {0};
+    state.tail = w;
+    while (state.tail.len) {
+        state = utf16decode_(state.tail);
+        u8 tmp[4];
+        len += utf8encode_(tmp, state.rune);
+    }
+
+    s8 s = {0};
+    s.s = new(perm, u8, len);
+    state.tail = w;
+    while (state.tail.len) {
+        state = utf16decode_(state.tail);
+        s.len += utf8encode_(s.s+s.len, state.rune);
+    }
+    return s;
 }
 
 // For communication with os_write()
@@ -146,9 +235,17 @@ static config *newconfig_(os *ctx)
         conf->args = new(&perm, u8*, conf->nargs);
 
         for (i32 i = 1; i < argc; i++) {
-            i32 len = WideCharToMultiByte(CP_UTF8, 0, wargv[i], -1, 0, 0, 0, 0);
-            conf->args[i-1] = new(&perm, u8, len);
-            WideCharToMultiByte(CP_UTF8, 0, wargv[i], -1, conf->args[i-1], len, 0, 0);
+            i32 wlen = 0;
+            while (wargv[i][wlen]) wlen++;
+            
+            s16 wide = {wargv[i], wlen};
+            s8 utf8_arg = fromwide_(&perm, wide);
+            
+            // Extend the allocation for null terminator
+            u8 *null_term = new(&perm, u8, 1);
+            *null_term = 0;
+            
+            conf->args[i-1] = utf8_arg.s;
         }
     } else {
         conf->nargs = 0;
@@ -220,21 +317,36 @@ static i32 os_read(os *ctx, i32 fd, u8 *buf, i32 len)
     return bytesRead;
 }
 
-static b32 os_path_is_dir(os *ctx, s8 path)
+static b32 os_path_is_dir(arena scratch, s8 path)
 {
-    c16 wpath[32767];  // Maximum Windows path length
-    
     utf8 state = {0};
     state.tail = path;
-    i32 wlen = 0;
     
-    while (state.tail.len && wlen < countof(wpath) - 1) {
+    // First pass: count required UTF-16 code units dynamically
+    utf8 count_state = state;
+    i32 required_len = 0;
+    while (count_state.tail.len) {
+        count_state = utf8decode_(count_state.tail);
+        if (count_state.rune >= 0x10000) {
+            required_len += 2;  // Surrogate pair
+        } else {
+            required_len += 1;
+        }
+    }
+    
+    // Allocate exactly the required size from scratch arena (+1 for null terminator)
+    c16 *wpath = new(&scratch, c16, required_len + 1);
+    
+    // Convert UTF-8 to UTF-16 dynamically
+    i32 wlen = 0;
+    while (state.tail.len && wlen < required_len) {
         state = utf8decode_(state.tail);
         wlen += utf16encode_(wpath + wlen, state.rune);
     }
     wpath[wlen] = 0;  // Null terminate
 
     i32 attr = GetFileAttributesW(wpath);
+    
     if (attr == -1) {
         return 0;  // Path doesn't exist or access denied
     }
@@ -243,16 +355,33 @@ static b32 os_path_is_dir(os *ctx, s8 path)
     return (attr & FILE_ATTRIBUTE_DIRECTORY) != 0;
 }
 
-static s8node *os_list_dir(os *ctx, arena *perm, s8 path)
+static s8node *os_list_dir(arena *perm, s8 path)
 {
-    // Create search pattern: path\*
-    c16 wpath[32767];
+    arena scratch = *perm;
+    
+    // Calculate required UTF-16 buffer size for search pattern dynamically
     utf8 state = {0};
     state.tail = path;
-    i32 wlen = 0;
+    i32 required_len = 0;
+    
+    while (state.tail.len) {
+        state = utf8decode_(state.tail);
+        if (state.rune >= 0x10000) {
+            required_len += 2;  // Surrogate pair
+        } else {
+            required_len += 1;
+        }
+    }
+    
+    // Add space for /* pattern and null terminator
+    required_len += 3;
+    
+    c16 *wpath = new(&scratch, c16, required_len);
     
     // Convert path to UTF-16
-    while (state.tail.len && wlen < countof(wpath) - 4) {  // Reserve space for \* and null
+    state.tail = path;
+    i32 wlen = 0;
+    while (state.tail.len && wlen < required_len - 3) {  // Reserve space for \* and null
         state = utf8decode_(state.tail);
         wlen += utf16encode_(wpath + wlen, state.rune);
     }
@@ -275,7 +404,6 @@ static s8node *os_list_dir(os *ctx, arena *perm, s8 path)
     s8node **tail = &head;
     
     do {
-        // Get length of wide filename
         i32 name_len_w = 0;
         while (fd.name[name_len_w]) name_len_w++;
         
@@ -285,17 +413,27 @@ static s8node *os_list_dir(os *ctx, arena *perm, s8 path)
             continue;
         }
         
-        // Convert filename from UTF-16 to UTF-8
-        i32 name_utf8_len = WideCharToMultiByte(CP_UTF8, 0, fd.name, name_len_w, 0, 0, 0, 0);
-        if (!name_utf8_len) continue;  // Skip if conversion fails
+        // Calculate UTF-8 length for filename first
+        s16 wide_name = {fd.name, name_len_w};
+        utf16 state = {0};
+        state.tail = wide_name;
+        iz utf8_filename_len = 0;
+        while (state.tail.len) {
+            state = utf16decode_(state.tail);
+            u8 tmp[4];
+            utf8_filename_len += utf8encode_(tmp, state.rune);
+        }
         
-        // Create full path: original_path/filename
+        if (!utf8_filename_len) continue;  // Skip if conversion fails
+        
+        // Calculate full path length
         iz full_path_len = path.len;
         if (path.len > 0 && path.s[path.len-1] != '\\' && path.s[path.len-1] != '/') {
             full_path_len += 1;  // Add separator
         }
-        full_path_len += name_utf8_len;
+        full_path_len += utf8_filename_len;
         
+        // Allocate full path buffer from permanent arena
         u8 *full_path = new(perm, u8, full_path_len);
         
         // Copy original path
@@ -309,10 +447,14 @@ static s8node *os_list_dir(os *ctx, arena *perm, s8 path)
             full_path[pos++] = '/';
         }
         
-        // Convert filename to UTF-8
-        WideCharToMultiByte(CP_UTF8, 0, fd.name, name_len_w, (u8*)(full_path + pos), name_utf8_len, 0, 0);
+        // Convert filename directly into the full path buffer
+        state.tail = wide_name;
+        while (state.tail.len) {
+            state = utf16decode_(state.tail);
+            pos += utf8encode_(full_path + pos, state.rune);
+        }
         
-        // Create node
+        // Create node and allocate from input arena
         s8node *node = new(perm, s8node, 1);
         node->str = (s8){full_path, full_path_len};
         node->next = 0;
