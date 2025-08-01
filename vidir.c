@@ -39,7 +39,6 @@ typedef struct {
     arena perm;
     u8  **args;         // command line arguments (minus argv[0])
     i32   nargs;        // number of arguments
-    s8    editor;       // $EDITOR environment variable
 } config;
 
 

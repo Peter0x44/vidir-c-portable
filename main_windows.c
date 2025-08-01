@@ -193,20 +193,21 @@ static arena newarena_(iz cap)
     return arena;
 }
 
-// Get environment variable as s8
-static s8 fromenv_(arena *perm, c16 *name)
+
+
+// Get environment variable as UTF-16
+static s16 fromenv_w(arena *perm, c16 *name)
 {
     i32 wlen = GetEnvironmentVariableW(name, 0, 0);
     if (!wlen) {
-        s8 r = {0};
+        s16 r = {0};
         return r;
     }
     
     c16 *wbuf = new(perm, c16, wlen);
     GetEnvironmentVariableW(name, wbuf, wlen);
     
-    s16 wide = {wbuf, wlen - 1};  // Exclude null terminator
-    return fromwide_(perm, wide);
+    return (s16){wbuf, wlen - 1};  // Exclude null terminator
 }
 
 static config *newconfig_(os *ctx)
@@ -215,9 +216,7 @@ static config *newconfig_(os *ctx)
     perm.ctx = ctx;
     config *conf = new(&perm, config, 1);
     conf->perm = perm;
-    
-    conf->editor = fromenv_(&perm, L"EDITOR");
-    
+        
     c16 *cmdline = GetCommandLineW();
     i32 argc = 0;
     c16 **wargv = CommandLineToArgvW(cmdline, &argc);
@@ -565,6 +564,121 @@ static void os_remove_temp_file(os *ctx)
 }
 
 
+#ifndef DEFAULT_EDTIOR
+#define DEFAULT_EDITOR L"notepad"
+#endif
+// Invoke editor on temp file using busybox sh -c
+// This is okay for w64devkit, but might need adjustment in other environments.
+
+static b32 os_invoke_editor(os *ctx, arena *scratch)
+{
+    if (!ctx->temp_file_path_w) {
+        assert(0 && "Implement proper error");  // No temp file to edit
+    }
+    
+    s16 editor = fromenv_w(scratch, L"EDITOR");
+    if (!editor.len) {
+        editor = (s16){ DEFAULT_EDITOR, countof(DEFAULT_EDITOR) - 1};
+    }
+    
+    // Build command line: busybox sh -c "editor \"tempfile\""
+    i32 tempfile_len = 0;
+    while (ctx->temp_file_path_w[tempfile_len]) tempfile_len++;
+    
+    i32 total_len = countof(L"busybox sh ") - 1 +  // "busybox sh " (exclude null)
+                    countof(L"-c ") - 1 +          // "-c " (exclude null)
+                    1 +                            // opening quote
+                    editor.len +                   // editor name
+                    1 +                            // space between editor and file
+                    1 +                            // opening quote for tempfile
+                    tempfile_len +                 // temp file path
+                    1 +                            // closing quote for tempfile
+                    1 +                            // closing quote for -c
+                    1;                             // null terminator
+    
+    c16 *cmdline = new(scratch, c16, total_len);
+    i32 pos = 0;
+    
+    // Copy "busybox sh "
+    c16 busybox[] = L"busybox sh ";
+    for (i32 i = 0; i < countof(busybox) - 1; i++) {  // Exclude null terminator
+        cmdline[pos++] = busybox[i];
+    }
+    
+    // Copy "-c "
+    cmdline[pos++] = L'-';
+    cmdline[pos++] = L'c';
+    cmdline[pos++] = L' ';
+    
+    // Opening quote
+    cmdline[pos++] = L'"';
+    
+    // Copy editor
+    for (i32 i = 0; i < editor.len; i++) {
+        cmdline[pos++] = editor.s[i];
+    }
+    
+    // Space
+    cmdline[pos++] = L' ';
+    
+    // Opening quote for temp file path
+    cmdline[pos++] = L'"';
+    
+    // Copy temp file path, converting \ to /
+    for (i32 i = 0; i < tempfile_len; i++) {
+        if (ctx->temp_file_path_w[i] == L'\\') {
+            cmdline[pos++] = L'/';
+        } else {
+            cmdline[pos++] = ctx->temp_file_path_w[i];
+        }
+    }
+    
+    // Closing quote for temp file path
+    cmdline[pos++] = L'"';
+    
+    // Closing quote for -c argument
+    cmdline[pos++] = L'"';
+    
+    // Null terminator
+    cmdline[pos] = 0;
+    
+    startupinfo si = {0};
+    si.cb = sizeof(startupinfo);
+    processinfo pi = {0};
+    
+    // Create the process
+    b32 success = CreateProcessW(
+        0,           // Application name (use command line)
+        cmdline,     // Command line
+        0,           // Process security attributes
+        0,           // Thread security attributes
+        0,           // Inherit handles
+        0,           // Creation flags
+        0,           // Environment
+        0,           // Current directory
+        &si,         // Startup info
+        &pi          // Process info
+    );
+    
+    if (!success) {
+        return 0;  // Failed to start process
+    }
+    
+    // Wait for the process to complete
+    WaitForSingleObject(pi.hProcess, INFINITE);
+    
+    // Get exit code
+    i32 exit_code = 0;
+    GetExitCodeProcess(pi.hProcess, &exit_code);
+    
+    // Clean up handles
+    CloseHandle(pi.hProcess);
+    CloseHandle(pi.hThread);
+    
+    return exit_code == 0;  // Return success if editor exited cleanly
+}
+
+
 
 #if 0
 __attribute((force_align_arg_pointer))
@@ -579,6 +693,9 @@ void mainCRTStartup(void) {
     ctx->handles[2].isconsole = GetConsoleMode(ctx->handles[2].h, &dummy);
 
     config *conf = newconfig_(ctx);
+    
+    // Initialize temp file for fd 3
+    os_create_temp_file(ctx, &conf->perm);
     
     vidir(conf);
     
