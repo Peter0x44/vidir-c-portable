@@ -170,12 +170,14 @@ static s8 fromwide_(arena *perm, s16 w)
 
 // For communication with os_write()
 struct os {
-    // 4 handles: stdin stdout stderr
+    // 4 handles: stdin stdout stderr tempfile
     struct {
         iptr h;
         b32  isconsole;
         b32  err;
     } handles[4];
+    
+    c16 *temp_file_path_w;  // UTF-16 path to temp file
 };
 
 static arena newarena_(iz cap)
@@ -459,34 +461,60 @@ static s8node *os_list_dir(arena *perm, s8 path)
     return head;
 }
 
-static s8 os_get_temp_file(os *ctx, arena *perm)
+// Create a temp file, and open "file descriptor 3" with it
+// NOTE: MAX_PATH hardcoded buffer uses here are okay.
+// GetTempPathW documents:
+// The maximum possible return value is MAX_PATH+1 (261).
+// GetTempFileNameW documents:
+// The string cannot be longer than MAX_PATH–14 characters or GetTempFileName will fail. 
+
+static void os_create_temp_file(os *ctx, arena *perm)
 {
-    c16 temp_file[32767];
-    
-    i32 result = GetTempFileNameW(0, L"vidir", 0, temp_file);
-    if (result == 0) {
-        
-        return (s8){0,0};
+    c16 temp_dir[261];
+    i32 temp_dir_len = GetTempPathW(260, temp_dir);
+    if (temp_dir_len == 0) {
+        assert(0 && "TODO: Exit if this happens")
+        ctx->handles[3].err = 1;
+        return;
     }
     
-    // Get length of temp file path
-    i32 wlen = 0;
-    while (temp_file[wlen]) wlen++;
-    
-    i32 utf8_len = WideCharToMultiByte(CP_UTF8, 0, temp_file, wlen, 0, 0, 0, 0);
-    if (utf8_len <= 0) {
-        return (s8){0, 0};
+    c16 temp_file[261];
+    if (!GetTempFileNameW(temp_dir, L"vdr", 0, temp_file)) {
+        ctx->handles[3].err = 1;
+        assert(0 && "TODO: Exit if this happens");
+        return;
     }
     
-    u8 *utf8_path = new(perm, u8, utf8_len);
-    WideCharToMultiByte(CP_UTF8, 0, temp_file, wlen, utf8_path, utf8_len, 0, 0);
+    i32 path_len = 0;
+    while (temp_file[path_len]) path_len++;
     
-    s8 temp_path = {utf8_path, utf8_len};
+    ctx->temp_file_path_w = new(perm, c16, path_len + 1);
+    for (i32 i = 0; i <= path_len; i++) {  // Include null terminator
+        ctx->temp_file_path_w[i] = temp_file[i];
+    }
     
-    return temp_path;
+    // Open the temp file
+    ctx->handles[3].h = CreateFileW(
+        temp_file,
+        GENERIC_READ | GENERIC_WRITE,
+        0,  // No sharing
+        0,  // Default security
+        CREATE_ALWAYS,
+        FILE_ATTRIBUTE_TEMPORARY,
+        0
+    );
+    
+    if (ctx->handles[3].h == INVALID_HANDLE_VALUE) {
+        ctx->handles[3].err = 1;
+        assert(0 && "TODO: Exit if this happens");
+    }
+    
+    ctx->handles[3].isconsole = 0;
+    ctx->handles[3].err = 0;
 }
 
-#if 1
+
+#if 0
 __attribute((force_align_arg_pointer))
 void mainCRTStartup(void) {
     os ctx[1] = {0};
