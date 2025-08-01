@@ -473,7 +473,7 @@ static void os_create_temp_file(os *ctx, arena *perm)
     c16 temp_dir[261];
     i32 temp_dir_len = GetTempPathW(260, temp_dir);
     if (temp_dir_len == 0) {
-        assert(0 && "TODO: Exit if this happens")
+        assert(0 && "TODO: Exit if this happens");
         ctx->handles[3].err = 1;
         return;
     }
@@ -496,7 +496,7 @@ static void os_create_temp_file(os *ctx, arena *perm)
     // Open the temp file
     ctx->handles[3].h = CreateFileW(
         temp_file,
-        GENERIC_READ | GENERIC_WRITE,
+        GENERIC_WRITE,
         0,  // No sharing
         0,  // Default security
         CREATE_ALWAYS,
@@ -512,6 +512,58 @@ static void os_create_temp_file(os *ctx, arena *perm)
     ctx->handles[3].isconsole = 0;
     ctx->handles[3].err = 0;
 }
+
+// Close temp file so editor can open it
+static void os_close_temp_file(os *ctx)
+{
+    if (ctx->handles[3].h && ctx->handles[3].h != INVALID_HANDLE_VALUE) {
+        CloseHandle(ctx->handles[3].h);
+        ctx->handles[3].h = INVALID_HANDLE_VALUE;
+    }
+}
+
+// Open for reading
+static void os_open_temp_file(os *ctx)
+{
+    if (!ctx->temp_file_path_w) {
+        ctx->handles[3].err = 1;
+        return;
+    }
+    
+    ctx->handles[3].h = CreateFileW(
+        ctx->temp_file_path_w,
+        GENERIC_READ,
+        0,
+        0,
+        OPEN_EXISTING,
+        FILE_ATTRIBUTE_TEMPORARY,
+        0
+    );
+    
+    if (ctx->handles[3].h == INVALID_HANDLE_VALUE) {
+        ctx->handles[3].err = 1;
+        assert(0 && "TODO: exit when this happens");
+        return;
+    }
+    
+    ctx->handles[3].isconsole = 0;
+    ctx->handles[3].err = 0;
+}
+
+// Remove temp file from filesystem
+static void os_remove_temp_file(os *ctx)
+{
+    // Close the file first if it's still open
+    if (ctx->handles[3].h && ctx->handles[3].h != INVALID_HANDLE_VALUE) {
+        CloseHandle(ctx->handles[3].h);
+        ctx->handles[3].h = INVALID_HANDLE_VALUE;
+    }
+    
+    if (ctx->temp_file_path_w) {
+        DeleteFileW(ctx->temp_file_path_w);
+    }
+}
+
 
 
 #if 0
