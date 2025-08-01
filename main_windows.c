@@ -326,6 +326,33 @@ static s8node *os_list_dir(os *ctx, arena *perm, s8 path)
     return head;
 }
 
+static s8 os_get_temp_file(os *ctx, arena *perm)
+{
+    c16 temp_file[32767];
+    
+    i32 result = GetTempFileNameW(0, L"vidir", 0, temp_file);
+    if (result == 0) {
+        
+        return (s8){0,0};
+    }
+    
+    // Get length of temp file path
+    i32 wlen = 0;
+    while (temp_file[wlen]) wlen++;
+    
+    i32 utf8_len = WideCharToMultiByte(CP_UTF8, 0, temp_file, wlen, 0, 0, 0, 0);
+    if (utf8_len <= 0) {
+        return (s8){0, 0};
+    }
+    
+    u8 *utf8_path = new(perm, u8, utf8_len);
+    WideCharToMultiByte(CP_UTF8, 0, temp_file, wlen, utf8_path, utf8_len, 0, 0);
+    
+    s8 temp_path = {utf8_path, utf8_len};
+    
+    return temp_path;
+}
+
 #if 1
 __attribute((force_align_arg_pointer))
 void mainCRTStartup(void) {

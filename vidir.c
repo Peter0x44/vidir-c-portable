@@ -150,6 +150,7 @@ static void os_write(os *, i32 fd, s8);
 static i32  os_read(os *, i32 fd, u8 *, i32);
 static b32  os_path_is_dir(os *, s8 path);
 static s8node *os_list_dir(os *, arena *, s8 path);
+static s8   os_get_temp_file(os *, arena *);
 
 typedef struct {
     arena *perm;
@@ -342,8 +343,10 @@ static void vidir(config *conf)
                 paths_count++;
             }
         }
-    } else {
-        // No arguments provided, default to current directory
+    }
+    
+    // No paths provided, default to .
+    if (paths_count == 0) {
         s8 current_dir = S(".");
         s8 *new_paths = new(perm, s8, paths_count + 1);
         new_paths[0] = current_dir;
