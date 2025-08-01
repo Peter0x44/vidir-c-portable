@@ -220,6 +220,112 @@ static i32 os_read(os *ctx, i32 fd, u8 *buf, i32 len)
     return bytesRead;
 }
 
+static b32 os_path_is_dir(os *ctx, s8 path)
+{
+    c16 wpath[32767];  // Maximum Windows path length
+    
+    utf8 state = {0};
+    state.tail = path;
+    i32 wlen = 0;
+    
+    while (state.tail.len && wlen < countof(wpath) - 1) {
+        state = utf8decode_(state.tail);
+        wlen += utf16encode_(wpath + wlen, state.rune);
+    }
+    wpath[wlen] = 0;  // Null terminate
+
+    i32 attr = GetFileAttributesW(wpath);
+    if (attr == -1) {
+        return 0;  // Path doesn't exist or access denied
+    }
+    
+    // Check if it's a directory
+    return (attr & FILE_ATTRIBUTE_DIRECTORY) != 0;
+}
+
+static s8node *os_list_dir(os *ctx, arena *perm, s8 path)
+{
+    // Create search pattern: path\*
+    c16 wpath[32767];
+    utf8 state = {0};
+    state.tail = path;
+    i32 wlen = 0;
+    
+    // Convert path to UTF-16
+    while (state.tail.len && wlen < countof(wpath) - 4) {  // Reserve space for \* and null
+        state = utf8decode_(state.tail);
+        wlen += utf16encode_(wpath + wlen, state.rune);
+    }
+    
+    // Add /* pattern (or just * if path already ends with /)
+    if (wlen > 0 && wpath[wlen-1] != '\\' && wpath[wlen-1] != '/') {
+        wpath[wlen++] = '/';
+    }
+    wpath[wlen++] = '*';
+    wpath[wlen] = 0;  // Null terminate
+    
+    // Start directory search
+    finddata fd;
+    iptr handle = FindFirstFileW(wpath, &fd);
+    if (handle == INVALID_HANDLE_VALUE) {
+        return 0;  // Directory doesn't exist or can't be read
+    }
+    
+    s8node *head = 0;
+    s8node **tail = &head;
+    
+    do {
+        // Get length of wide filename
+        i32 name_len_w = 0;
+        while (fd.name[name_len_w]) name_len_w++;
+        
+        // Skip . and .. entries
+        if ((name_len_w == 1 && fd.name[0] == '.') ||
+            (name_len_w == 2 && fd.name[0] == '.' && fd.name[1] == '.')) {
+            continue;
+        }
+        
+        // Convert filename from UTF-16 to UTF-8
+        i32 name_utf8_len = WideCharToMultiByte(CP_UTF8, 0, fd.name, name_len_w, 0, 0, 0, 0);
+        if (!name_utf8_len) continue;  // Skip if conversion fails
+        
+        // Create full path: original_path/filename
+        iz full_path_len = path.len;
+        if (path.len > 0 && path.s[path.len-1] != '\\' && path.s[path.len-1] != '/') {
+            full_path_len += 1;  // Add separator
+        }
+        full_path_len += name_utf8_len;
+        
+        u8 *full_path = new(perm, u8, full_path_len);
+        
+        // Copy original path
+        for (iz i = 0; i < path.len; i++) {
+            full_path[i] = path.s[i];
+        }
+        iz pos = path.len;
+        
+        // Add separator if needed
+        if (path.len > 0 && path.s[path.len-1] != '\\' && path.s[path.len-1] != '/') {
+            full_path[pos++] = '/';
+        }
+        
+        // Convert filename to UTF-8
+        WideCharToMultiByte(CP_UTF8, 0, fd.name, name_len_w, (u8*)(full_path + pos), name_utf8_len, 0, 0);
+        
+        // Create node
+        s8node *node = new(perm, s8node, 1);
+        node->str = (s8){full_path, full_path_len};
+        node->next = 0;
+        
+        *tail = node;
+        tail = &node->next;
+        
+    } while (FindNextFileW(handle, &fd));
+    
+    FindClose(handle);
+    return head;
+}
+
 #if 1
 __attribute((force_align_arg_pointer))
 void mainCRTStartup(void) {

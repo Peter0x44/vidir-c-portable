@@ -92,8 +92,64 @@ static b32 startswith(s8 s, s8 prefix)
     return s.len >= prefix.len && s8equals(takehead(s, prefix.len), prefix);
 }
 
+// String comparison for sorting
+static i32 u8compare(u8 *a, u8 *b, iz n)
+{
+    for (; n; n--) {
+        i32 d = *a++ - *b++;
+        if (d) return d;
+    }
+    return 0;
+}
+
+static i32 s8compare_(s8 a, s8 b)
+{
+    iz len = a.len<b.len ? a.len : b.len;
+    iz r   = u8compare(a.s, b.s, len);
+    return r ? r : a.len-b.len;
+}
+
+// Merge sort for s8node linked list
+static s8node *s8sort_(s8node *head)
+{
+    if (!head || !head->next) {
+        return head;
+    }
+
+    iz      len  = 0;
+    s8node *tail = head;
+    s8node *last = head;
+    for (s8node *n = head; n; n = n->next, len++) {
+        if (len & 1) {
+            last = tail;
+            tail = tail->next;
+        }
+    }
+
+    last->next = 0;
+    head = s8sort_(head);
+    tail = s8sort_(tail);
+
+    s8node  *rhead = 0;
+    s8node **rtail = &rhead;
+    while (head && tail) {
+        if (s8compare_(head->str, tail->str) < 1) {
+            *rtail = head;
+            head = head->next;
+        } else {
+            *rtail = tail;
+            tail = tail->next;
+        }
+        rtail = &(*rtail)->next;
+    }
+    *rtail = head ? head : tail;
+    return rhead;
+}
+
 static void os_write(os *, i32 fd, s8);
 static i32  os_read(os *, i32 fd, u8 *, i32);
+static b32  os_path_is_dir(os *, s8 path);
+static s8node *os_list_dir(os *, arena *, s8 path);
 
 typedef struct {
     arena *perm;
@@ -275,15 +331,48 @@ static void vidir(config *conf)
                     assert(0 && "Unknown option: TODO exit");
                 }
             } else {
-                // Reallocate paths array with one more slot
-                s8 *new_paths = new(perm, s8, paths_count + 1);
-                for (i32 j = 0; j < paths_count; j++) {
-                    new_paths[j] = paths[j];
+                if (os_path_is_dir(perm->ctx, arg)) {
+                    // Expand directory contents
+                    s8node *entries = os_list_dir(perm->ctx, perm, arg);
+                    entries = s8sort_(entries);  // Sort directory listings
+                    while (entries) {
+                        // Reallocate paths array with one more slot
+                        s8 *new_paths = new(perm, s8, paths_count + 1);
+                        for (i32 j = 0; j < paths_count; j++) {
+                            new_paths[j] = paths[j];
+                        }
+                        new_paths[paths_count] = entries->str;
+                        paths = new_paths;
+                        paths_count++;
+                        entries = entries->next;
+                    }
+                } else {
+                    // Regular file, add as-is
+                    s8 *new_paths = new(perm, s8, paths_count + 1);
+                    for (i32 j = 0; j < paths_count; j++) {
+                        new_paths[j] = paths[j];
+                    }
+                    new_paths[paths_count] = arg;
+                    paths = new_paths;
+                    paths_count++;
                 }
-                new_paths[paths_count] = arg;
-                paths = new_paths;
-                paths_count++;
             }
+        }
+    } else {
+        // No arguments provided, default to current directory
+        s8 current_dir = S(".");
+        s8node *entries = os_list_dir(perm->ctx, perm, current_dir);
+        entries = s8sort_(entries);  // Sort directory listings
+        while (entries) {
+            // Reallocate paths array with one more slot
+            s8 *new_paths = new(perm, s8, paths_count + 1);
+            for (i32 j = 0; j < paths_count; j++) {
+                new_paths[j] = paths[j];
+            }
+            new_paths[paths_count] = entries->str;
+            paths = new_paths;
+            paths_count++;
+            entries = entries->next;
         }
     }
 
@@ -336,6 +425,9 @@ static void vidir(config *conf)
         for (i32 i = 0; i < paths_count; i++) {
             prints8(out, S("  "));
             prints8(out, paths[i]);
+            if (os_path_is_dir(perm->ctx, paths[i])) {
+                prints8(out, S(" (directory)"));
+            }
             prints8(out, S("\n"));
         }
     }
