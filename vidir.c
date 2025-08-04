@@ -147,7 +147,7 @@ static s8node *s8sort_(s8node *head)
 
 static void os_write(os *, i32 fd, s8);
 static i32  os_read(os *, i32 fd, u8 *, i32);
-static b32  os_path_is_dir(arena, s8 path);
+static b32  os_path_is_dir(arena scratch, s8 path);
 static s8node *os_list_dir(arena *, s8 path);
 static s8    os_get_temp_file(arena *);
 static b32  os_open_file_for_write(os *, s8 path);
@@ -439,7 +439,7 @@ static void vidir(config *conf)
         for (i32 i = 0; i < paths_count; i++) {
             prints8(out, S("  "));
             prints8(out, paths[i]);
-            if (os_path_is_dir(perm->ctx, paths[i])) {
+            if (os_path_is_dir(*perm, paths[i])) {
                 prints8(out, S(" (directory)"));
             }
             prints8(out, S("\n"));
