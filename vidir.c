@@ -69,6 +69,68 @@ static s8 s8fromcstr(u8 *z)
     }
     return s;
 }
+// Hash with the identity function
+static u32 i32hash(i32 x)
+{
+    return (u32)x;
+}
+
+// Hash trie mapping line numbers to paths
+typedef struct pathmap pathmap;
+struct pathmap {
+    pathmap *child[4];   // 4-way trie using bottom 2 bits of the key
+    i32      key;
+    s8       path;
+};
+
+// Insert or lookup a path by line number
+static s8 *pathmap_insert(pathmap **m, i32 key, arena *perm)
+{
+    u32 h = i32hash(key);
+    while (*m) {
+        if ((*m)->key == key) {
+            return &(*m)->path;
+        }
+        m = &(*m)->child[h & 0x3];  // Use bottom 2 bits
+        h >>= 2;
+    }
+    if (!perm) {
+        return 0;  // Not found, don't create
+    }
+    *m = new(perm, pathmap, 1);
+    (*m)->key = key;
+    (*m)->path = (s8){0}; // Initialize to empty
+    return &(*m)->path;
+}
+
+// Lookup a path by line number (read-only)
+static s8 *pathmap_lookup(pathmap **m, i32 key)
+{
+    return pathmap_insert(m, key, 0);  // No arena = lookup only
+}
+
+// Extract directory path from a file path
+static s8 dirname_s8(s8 path)
+{
+    iz last_slash = -1;
+    for (iz i = path.len - 1; i >= 0; i--) {
+        if (path.s[i] == '/' || path.s[i] == '\\') {
+            last_slash = i;
+            break;
+        }
+    }
+    
+    if (last_slash == -1) {
+        return S(".");  // No slash found, use current directory
+    }
+    
+    if (last_slash == 0) {
+        return S("/");  // Root directory
+    }
+    
+    // Return slice of original string up to last slash
+    return (s8){path.s, last_slash};
+}
 
 static b32 s8equals(s8 a, s8 b)
 {
