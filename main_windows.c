@@ -678,6 +678,47 @@ static b32 os_invoke_editor(os *ctx, arena scratch)
     return exit_code == 0;  // Return success if editor exited cleanly
 }
 
+// Delete a file or directory
+static b32 os_delete_path(os *ctx, arena scratch, s8 path)
+{
+    // Calculate required UTF-16 buffer size
+    utf8 state = {0};
+    state.tail = path;
+    i32 required_len = 0;
+    
+    while (state.tail.len) {
+        state = utf8decode_(state.tail);
+        if (state.rune >= 0x10000) {
+            required_len += 2;  // Surrogate pair
+        } else {
+            required_len += 1;
+        }
+    }
+    
+    // Allocate from temporary arena
+    c16 *wpath = new(&scratch, c16, required_len + 1);
+    
+    // Convert UTF-8 to UTF-16
+    state.tail = path;
+    i32 wlen = 0;
+    while (state.tail.len && wlen < required_len) {
+        state = utf8decode_(state.tail);
+        wlen += utf16encode_(wpath + wlen, state.rune);
+    }
+    wpath[wlen] = 0;  // Null terminate
+    
+    // Check if it's a directory
+    i32 attr = GetFileAttributesW(wpath);
+    if (attr == -1) {
+        return 0;  // File doesn't exist
+    }
+    
+    if (attr & FILE_ATTRIBUTE_DIRECTORY) {
+        return RemoveDirectoryW(wpath) != 0;
+    } else {
+        return DeleteFileW(wpath) != 0;
+    }
+}
 
 
 #if 1
