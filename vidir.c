@@ -154,6 +154,7 @@ static s8    os_get_temp_file(arena *);
 static b32  os_open_file_for_write(os *, s8 path);
 static b32  os_invoke_editor(os *ctx, arena scratch);
 static void os_close_temp_file(os *ctx);
+static void os_open_temp_file(os *ctx);
 
 typedef struct {
     arena *perm;
@@ -329,6 +330,11 @@ static void vidir(config *conf)
     u8buf *out = newfdbuf(perm, 1, 4096);  // stdout
     u8buf *err = newfdbuf(perm, 2, 4096);  // stderr
     u8buf *tmp = newfdbuf(perm, 3, 4096);  // temp file
+    u8input *input = newinput(perm, 3, 4096);  // reading back from temp file
+    u8input *stdin_input = newinput(perm, 0, 4096); // stdin reading
+    
+
+    
     
     // Simple growing array of file paths
     s8 *paths = 0;
@@ -365,8 +371,8 @@ static void vidir(config *conf)
         }
     }
     
-    // No paths provided, default to .
-    if (paths_count == 0) {
+    // No paths provided and not reading from stdin, default to .
+    if (paths_count == 0 && !read_from_stdin) {
         s8 current_dir = S(".");
         s8 *new_paths = new(perm, s8, paths_count + 1);
         new_paths[0] = current_dir;
@@ -376,10 +382,9 @@ static void vidir(config *conf)
 
     // Read from stdin if requested
     if (read_from_stdin) {
-        u8input *input = newinput(perm, 0, 4096);  // stdin
         
         for (;;) {
-            s8 line = nextline(input);
+            s8 line = nextline(stdin_input);
             if (line.len == 0 && line.s == 0) break;  // EOF (null pointer)
             
             // Trim trailing whitespace (including \r if present)
@@ -462,9 +467,9 @@ static void vidir(config *conf)
     }
     
     // Write paths to temporary file in vidir format
+    // <number>\t<name>\n
     i32 item_count = 0;
     for (i32 i = 0; i < paths_count; i++) {
-        // Skip . and .. entries like the Perl version
         s8 path = paths[i];
         s8 basename = path;
         
@@ -490,15 +495,9 @@ static void vidir(config *conf)
     
     flush(tmp);
     
-    prints8(out, S("vidir: wrote "));
-    printi64(out, item_count);
-    prints8(out, S(" items to temp file\n"));
-    flush(out);
-    
     // Close temp file so editor can open it
     os_close_temp_file(perm->ctx);
     
-    // Invoke editor on the temp file
     arena scratch = *perm;
     b32 editor_success = os_invoke_editor(perm->ctx, scratch);
     if (!editor_success) {
@@ -508,6 +507,28 @@ static void vidir(config *conf)
     }
     
     prints8(out, S("vidir: editor completed\n"));
+    
+    // Reopen temp file for reading
+    os_open_temp_file(perm->ctx);
+    
+    prints8(out, S("vidir: reading back temp file contents:\n"));
+    i32 line_number = 0;
+    
+    for (;;) {
+        s8 line = nextline(input);
+        if (line.len == 0 && line.s == 0) break;  // EOF
+        
+        line_number++;
+        prints8(out, S("  line "));
+        printi64(out, line_number);
+        prints8(out, S(": "));
+        prints8(out, line);
+        prints8(out, S("\n"));
+    }
+    
+    prints8(out, S("vidir: read "));
+    printi64(out, line_number);
+    prints8(out, S(" lines from temp file\n"));
     
     flush(out);
     flush(err);
