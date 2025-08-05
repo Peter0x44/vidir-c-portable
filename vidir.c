@@ -7,6 +7,7 @@ typedef unsigned char    u8;
 typedef   signed int     b32;
 typedef   signed int     i32;
 typedef unsigned int     u32;
+typedef   signed long long i64;
 typedef ptrdiff_t        iz;
 typedef          char    byte;
 
@@ -201,6 +202,22 @@ static void prints8(u8buf *b, s8 s)
             flush(b);
         }
     }
+}
+
+static void printi64(u8buf *b, i64 x)
+{
+    u8  tmp[32];
+    u8 *end = tmp + countof(tmp);
+    u8 *beg = end;
+    i64 t   = x<0 ? x : -x;
+    do {
+        *--beg = '0' - (u8)(t%10);
+    } while (t /= 10);
+    if (x < 0) {
+        *--beg = '-';
+    }
+    s8 numstr = {beg, end - beg};
+    prints8(b, numstr);
 }
 
 // Input buffer for reading from stdin
@@ -427,12 +444,7 @@ static void vidir(config *conf)
 
     // Print debug output showing what we collected
     prints8(out, S("vidir: collected "));
-    // TODO: Add a number printing function
-    if (paths_count < 10) {
-        prints8(out, (s8){(u8*)"0123456789" + paths_count, 1});
-    } else {
-        prints8(out, S("many"));
-    }
+    printi64(out, paths_count);
     prints8(out, S(" paths\n"));
     
     if (verbose) {

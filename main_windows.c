@@ -212,7 +212,7 @@ static s16 fromenv_w(arena *perm, c16 *name)
 
 static config *newconfig_(os *ctx)
 {
-    arena perm = newarena_(1<<20);
+    arena perm = newarena_(1<<23);
     perm.ctx = ctx;
     config *conf = new(&perm, config, 1);
     conf->perm = perm;
@@ -680,7 +680,7 @@ static b32 os_invoke_editor(os *ctx, arena *scratch)
 
 
 
-#if 0
+#if 1
 __attribute((force_align_arg_pointer))
 void mainCRTStartup(void) {
     os ctx[1] = {0};
