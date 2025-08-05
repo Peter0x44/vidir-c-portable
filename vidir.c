@@ -152,6 +152,8 @@ static b32  os_path_is_dir(arena scratch, s8 path);
 static s8node *os_list_dir(arena *, s8 path);
 static s8    os_get_temp_file(arena *);
 static b32  os_open_file_for_write(os *, s8 path);
+static b32  os_invoke_editor(os *ctx, arena scratch);
+static void os_close_temp_file(os *ctx);
 
 typedef struct {
     arena *perm;
@@ -326,6 +328,7 @@ static void vidir(config *conf)
     // Set up buffered output (like u-config)
     u8buf *out = newfdbuf(perm, 1, 4096);  // stdout
     u8buf *err = newfdbuf(perm, 2, 4096);  // stderr
+    u8buf *tmp = newfdbuf(perm, 3, 4096);  // temp file
     
     // Simple growing array of file paths
     s8 *paths = 0;
@@ -458,8 +461,54 @@ static void vidir(config *conf)
         }
     }
     
+    // Write paths to temporary file in vidir format
+    i32 item_count = 0;
+    for (i32 i = 0; i < paths_count; i++) {
+        // Skip . and .. entries like the Perl version
+        s8 path = paths[i];
+        s8 basename = path;
+        
+        // Find the last slash to get basename
+        for (iz j = path.len - 1; j >= 0; j--) {
+            if (path.s[j] == '/') {
+                basename.s = path.s + j + 1;
+                basename.len = path.len - j - 1;
+                break;
+            }
+        }
+        
+        if (s8equals(basename, S(".")) || s8equals(basename, S(".."))) {
+            continue;
+        }
+        
+        item_count++;
+        printi64(tmp, item_count);
+        prints8(tmp, S("\t"));
+        prints8(tmp, path);
+        prints8(tmp, S("\n"));
+    }
+    
+    flush(tmp);
+    
+    prints8(out, S("vidir: wrote "));
+    printi64(out, item_count);
+    prints8(out, S(" items to temp file\n"));
+    flush(out);
+    
+    // Close temp file so editor can open it
+    os_close_temp_file(perm->ctx);
+    
+    // Invoke editor on the temp file
+    arena scratch = *perm;
+    b32 editor_success = os_invoke_editor(perm->ctx, scratch);
+    if (!editor_success) {
+        prints8(err, S("vidir: failed to invoke editor\n"));
+        flush(err);
+        return;
+    }
+    
+    prints8(out, S("vidir: editor completed\n"));
+    
     flush(out);
     flush(err);
 }
-
-

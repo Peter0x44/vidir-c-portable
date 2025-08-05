@@ -570,13 +570,13 @@ static void os_remove_temp_file(os *ctx)
 // Invoke editor on temp file using busybox sh -c
 // This is okay for w64devkit, but might need adjustment in other environments.
 
-static b32 os_invoke_editor(os *ctx, arena *scratch)
+static b32 os_invoke_editor(os *ctx, arena scratch)
 {
     if (!ctx->temp_file_path_w) {
         assert(0 && "Implement proper error");  // No temp file to edit
     }
     
-    s16 editor = fromenv_w(scratch, L"EDITOR");
+    s16 editor = fromenv_w(&scratch, L"EDITOR");
     if (!editor.len) {
         editor = (s16){ DEFAULT_EDITOR, countof(DEFAULT_EDITOR) - 1};
     }
@@ -596,7 +596,7 @@ static b32 os_invoke_editor(os *ctx, arena *scratch)
                     1 +                            // closing quote for -c
                     1;                             // null terminator
     
-    c16 *cmdline = new(scratch, c16, total_len);
+    c16 *cmdline = new(&scratch, c16, total_len);
     i32 pos = 0;
     
     // Copy "busybox sh "
