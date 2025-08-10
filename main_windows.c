@@ -207,9 +207,7 @@ static arena newarena_(iz cap)
     arena arena = {0};
     arena.beg = VirtualAlloc(0, cap, MEM_COMMIT|MEM_RESERVE, PAGE_READWRITE);
     if (!arena.beg) {
-        arena.beg = (byte *)16;  // aligned, non-null, zero-size arena
-        //TODO make this bail. WTF is this? casting 16 to a pointer is not right.
-        cap = 0;
+        assert(0 && "TODO: Add better error: failed to allocate arena");
     }
     arena.end = arena.beg + cap;
     return arena;
@@ -342,6 +340,14 @@ static b32 os_path_is_dir(arena scratch, s8 path)
     
     // Check if it's a directory
     return (attr & FILE_ATTRIBUTE_DIRECTORY) != 0;
+}
+
+static b32 os_path_exists(arena scratch, s8 path)
+{
+    s16 wpath = towide_(&scratch, path);
+    i32 attr = GetFileAttributesW(wpath.s);
+    
+    return attr != -1;  // Path exists (file or directory)
 }
 
 static s8node *os_list_dir(arena *perm, s8 path)
@@ -654,7 +660,7 @@ static b32 os_delete_path(os *ctx, arena scratch, s8 path)
     }
 }
 
-// Create directories recursively (like mkdir -p)
+// Create directories recursively (mkdir -p)
 static b32 os_create_dir(os *ctx, arena scratch, s8 path)
 {
     s16 wpath = towide_(&scratch, path);

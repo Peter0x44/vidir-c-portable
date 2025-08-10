@@ -98,15 +98,19 @@ static s8 *pathmap_insert(pathmap **m, i32 key, arena *perm)
         return 0;  // Not found, don't create
     }
     *m = new(perm, pathmap, 1);
+    (*m)->child[0] = 0;
+    (*m)->child[1] = 0;
+    (*m)->child[2] = 0;
+    (*m)->child[3] = 0;
     (*m)->key = key;
     (*m)->path = (s8){0}; // Initialize to empty
     return &(*m)->path;
 }
 
-// Lookup a path by line number (read-only)
+// Lookup a path by line number
 static s8 *pathmap_lookup(pathmap **m, i32 key)
 {
-    return pathmap_insert(m, key, 0);  // No arena = lookup only
+    return pathmap_insert(m, key, 0);
 }
 
 // Extract directory path from a file path
@@ -211,12 +215,14 @@ static s8node *s8sort_(s8node *head)
 static void os_write(os *, i32 fd, s8);
 static i32  os_read(os *, i32 fd, u8 *, i32);
 static b32  os_path_is_dir(arena scratch, s8 path);
+static b32  os_path_exists(arena scratch, s8 path);
 static s8node *os_list_dir(arena *, s8 path);
-static s8    os_get_temp_file(arena *);
-static b32  os_open_file_for_write(os *, s8 path);
 static b32  os_invoke_editor(os *ctx, arena scratch);
 static void os_close_temp_file(os *ctx);
 static void os_open_temp_file(os *ctx);
+static b32  os_rename_file(os *ctx, arena scratch, s8 src, s8 dst);
+static b32  os_delete_path(os *ctx, arena scratch, s8 path);
+static b32  os_create_dir(os *ctx, arena scratch, s8 path);
 
 typedef struct {
     arena *perm;
@@ -380,6 +386,52 @@ static s8 nextline(u8input *b)
     return empty;
 }
 
+// Parse a line from temp file: "number\tpath"
+// Modifies line to contain only the path part, returns the line number via pointer
+// Returns true if line was parsed successfully, false if invalid
+static b32 parse_temp_line(s8 *line, i32 *line_number)
+{
+    // Scan for tab
+    iz tab_pos = -1;
+    for (iz i = 0; i < line->len; i++) {
+        if (line->s[i] == '\t') {
+            tab_pos = i;
+            break;
+        }
+    }
+    
+    if (tab_pos == -1) {
+        // No tab found - invalid line
+        return 0;
+    }
+    
+    // Parse number part
+    i32 num = 0;
+    for (iz i = 0; i < tab_pos; i++) {
+        if (line->s[i] >= '0' && line->s[i] <= '9') {
+            num = num * 10 + (line->s[i] - '0');
+        } else {
+            // Invalid character in number
+            return 0;
+        }
+    }
+    
+    // Modify line to contain only the path part
+    line->s += tab_pos + 1;
+    line->len -= tab_pos + 1;
+    
+    // Trim trailing whitespace from path
+    while (line->len > 0 && 
+           (line->s[line->len-1] == ' ' || 
+            line->s[line->len-1] == '\t' ||
+            line->s[line->len-1] == '\r')) {
+        line->len--;
+    }
+    
+    *line_number = num;
+    return 1;
+}
+
 static void vidir(config *);
 
 static void vidir(config *conf)
@@ -395,10 +447,9 @@ static void vidir(config *conf)
     u8input *input = newinput(perm, 3, 4096);  // reading back from temp file
     u8input *stdin_input = newinput(perm, 0, 4096); // stdin reading
     
-
+    // Hash trie to store original paths indexed by line number
+    pathmap *original_paths = 0;
     
-    
-    // Simple growing array of file paths
     s8 *paths = 0;
     i32 paths_count = 0;
 
@@ -512,22 +563,6 @@ static void vidir(config *conf)
     paths = final_paths;
     paths_count = final_count;
 
-    // Print debug output showing what we collected
-    prints8(out, S("vidir: collected "));
-    printi64(out, paths_count);
-    prints8(out, S(" paths\n"));
-    
-    if (verbose) {
-        for (i32 i = 0; i < paths_count; i++) {
-            prints8(out, S("  "));
-            prints8(out, paths[i]);
-            if (os_path_is_dir(*perm, paths[i])) {
-                prints8(out, S(" (directory)"));
-            }
-            prints8(out, S("\n"));
-        }
-    }
-    
     // Write paths to temporary file in vidir format
     // <number>\t<name>\n
     i32 item_count = 0;
@@ -549,6 +584,11 @@ static void vidir(config *conf)
         }
         
         item_count++;
+        
+        // Store the original path using pathmap (line numbers start at 1)
+        s8 *stored_path = pathmap_insert(&original_paths, item_count, perm);
+        *stored_path = path;
+        
         printi64(tmp, item_count);
         prints8(tmp, S("\t"));
         prints8(tmp, path);
@@ -568,29 +608,215 @@ static void vidir(config *conf)
         return;
     }
     
-    prints8(out, S("vidir: editor completed\n"));
-    
     // Reopen temp file for reading
     os_open_temp_file(perm->ctx);
     
-    prints8(out, S("vidir: reading back temp file contents:\n"));
-    i32 line_number = 0;
-    
+    b32 has_errors = 0;
+        
+    // Parse all lines from temp file and process operations
     for (;;) {
         s8 line = nextline(input);
         if (line.len == 0 && line.s == 0) break;  // EOF
         
-        line_number++;
-        prints8(out, S("  line "));
-        printi64(out, line_number);
-        prints8(out, S(": "));
-        prints8(out, line);
-        prints8(out, S("\n"));
+        // Skip empty lines
+        if (line.len == 0) continue;
+        
+        i32 parsed_line_num;
+        s8 line_copy = line;
+        if (!parse_temp_line(&line_copy, &parsed_line_num)) {
+            // Unable to parse line - this is an error
+            prints8(err, S("vidir: unable to parse line \""));
+            // Safely print the line - replace any control characters
+            for (iz i = 0; i < line.len; i++) {
+                if (line.s[i] >= 32 && line.s[i] <= 126) {
+                    u8 c = line.s[i];
+                    prints8(err, (s8){&c, 1});
+                } else {
+                    prints8(err, S("?"));
+                }
+            }
+            prints8(err, S("\", aborting\n"));
+            has_errors = 1;
+            flush(err);
+            return;
+        }
+        
+        // Look up the original path for this line number
+        s8 *original_path = pathmap_lookup(&original_paths, parsed_line_num);
+        if (!original_path) {
+            prints8(err, S("vidir: unknown item number "));
+            printi64(err, parsed_line_num);
+            prints8(err, S("\n"));
+            has_errors = 1;
+            flush(err);
+            return;
+        }
+        
+        s8 src = *original_path;
+        s8 dst = line_copy;  // After parse_temp_line, this contains just the path
+        
+        // Check if the source file still exists
+        if (!s8equals(src, dst)) {  // Only check if we're doing an operation
+            if (dst.len == 0) {
+                // This is deletion, don't check existence
+            } else if (!os_path_exists(scratch, src)) {
+                prints8(err, S("vidir: "));
+                prints8(err, src);
+                prints8(err, S(" does not exist\n"));
+                // Mark this item as processed by clearing it
+                *original_path = (s8){0};
+                continue;
+            }
+        }
+        
+        if (!s8equals(src, dst)) {
+            if (dst.len == 0) {
+                // Skip deletion for now - we'll handle it at the end
+            } else {
+                // Handle swaps: if destination exists and matches one of our items
+                if (os_path_exists(scratch, dst)) {
+                    // Generate a unique temporary name
+                    u8 *temp_name = new(perm, u8, dst.len + 10);
+                    for (iz i = 0; i < dst.len; i++) {
+                        temp_name[i] = dst.s[i];
+                    }
+                    temp_name[dst.len] = '~';
+                    s8 temp_path = {temp_name, dst.len + 1};
+                    
+                    i32 counter = 0;
+                    while (os_path_exists(scratch, temp_path)) {
+                        counter++;
+                        // Rebuild temp path with counter
+                        iz pos = dst.len + 1;
+                        i32 temp_counter = counter;
+                        u8 digits[16];
+                        iz digit_count = 0;
+                        
+                        do {
+                            digits[digit_count++] = '0' + (temp_counter % 10);
+                            temp_counter /= 10;
+                        } while (temp_counter > 0);
+                        
+                        // Reverse digits and copy
+                        for (iz i = 0; i < digit_count; i++) {
+                            temp_name[pos + i] = digits[digit_count - 1 - i];
+                        }
+                        temp_path.len = pos + digit_count;
+                    }
+                    
+                    if (!os_rename_file(perm->ctx, scratch, dst, temp_path)) {
+                        prints8(err, S("vidir: failed to rename "));
+                        prints8(err, dst);
+                        prints8(err, S(" to "));
+                        prints8(err, temp_path);
+                        prints8(err, S("\n"));
+                        has_errors = 1;
+                    } else {
+                        if (verbose) {
+                            prints8(out, S("'"));
+                            prints8(out, dst);
+                            prints8(out, S("' -> '"));
+                            prints8(out, temp_path);
+                            prints8(out, S("'\n"));
+                        }
+                        
+                        // Update any items that pointed to the old destination
+                        for (i32 j = 1; j <= item_count; j++) {
+                            s8 *check_path = pathmap_lookup(&original_paths, j);
+                            if (check_path && s8equals(*check_path, dst)) {
+                                // Copy temp_path to permanent memory
+                                u8 *perm_path = new(perm, u8, temp_path.len);
+                                for (iz k = 0; k < temp_path.len; k++) {
+                                    perm_path[k] = temp_path.s[k];
+                                }
+                                *check_path = (s8){perm_path, temp_path.len};
+                            }
+                        }
+                    }
+                }
+                
+                // Create destination directory if needed
+                s8 dst_dir = dirname_s8(dst);
+                if (!s8equals(dst_dir, S(".")) && !os_path_is_dir(scratch, dst_dir)) {
+                    if (!os_create_dir(perm->ctx, scratch, dst_dir)) {
+                        prints8(err, S("vidir: failed to create directory tree "));
+                        prints8(err, dst_dir);
+                        prints8(err, S("\n"));
+                        has_errors = 1;
+                    }
+                }
+                
+                // Perform the rename
+                if (!os_rename_file(perm->ctx, scratch, src, dst)) {
+                    prints8(err, S("vidir: failed to rename "));
+                    prints8(err, src);
+                    prints8(err, S(" to "));
+                    prints8(err, dst);
+                    prints8(err, S("\n"));
+                    has_errors = 1;
+                } else {
+                    if (verbose) {
+                        prints8(out, S("'"));
+                        prints8(out, src);
+                        prints8(out, S("' => '"));
+                        prints8(out, dst);
+                        prints8(out, S("'\n"));
+                    }
+                    
+                    // If we renamed a directory, update all items that were inside it
+                    if (os_path_is_dir(scratch, dst)) {
+                        for (i32 j = 1; j <= item_count; j++) {
+                            s8 *check_path = pathmap_lookup(&original_paths, j);
+                            if (check_path && check_path->len > src.len) {
+                                // Check if this path starts with src/ 
+                                b32 is_subpath = 1;
+                                for (iz k = 0; k < src.len && is_subpath; k++) {
+                                    if (check_path->s[k] != src.s[k]) {
+                                        is_subpath = 0;
+                                    }
+                                }
+                                if (is_subpath && (check_path->s[src.len] == '/' || check_path->s[src.len] == '\\')) {
+                                    // This item is inside the moved directory
+                                    iz suffix_len = check_path->len - src.len;
+                                    u8 *new_path = new(perm, u8, dst.len + suffix_len);
+                                    for (iz k = 0; k < dst.len; k++) {
+                                        new_path[k] = dst.s[k];
+                                    }
+                                    for (iz k = 0; k < suffix_len; k++) {
+                                        new_path[dst.len + k] = check_path->s[src.len + k];
+                                    }
+                                    *check_path = (s8){new_path, dst.len + suffix_len};
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        
+        // Mark this item as processed by clearing its pathmap entry
+        *original_path = (s8){0, 0};
     }
     
-    prints8(out, S("vidir: read "));
-    printi64(out, line_number);
-    prints8(out, S(" lines from temp file\n"));
+    // Now handle remaining items (these should be deleted)
+    for (i32 i = 1; i <= item_count; i++) {
+        
+        s8 *path = pathmap_lookup(&original_paths, i);
+        if (path && path->len > 0 && path->s) {  // Item was not processed, so it should be deleted
+            if (!os_delete_path(perm->ctx, scratch, *path)) {
+                prints8(err, S("vidir: failed to remove "));
+                prints8(err, *path);
+                prints8(err, S("\n"));
+                has_errors = 1;
+            } else {
+                if (verbose) {
+                    prints8(out, S("removed '"));
+                    prints8(out, *path);
+                    prints8(out, S("'\n"));
+                }
+            }
+        }
+    }
     
     flush(out);
     flush(err);
