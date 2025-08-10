@@ -147,6 +147,28 @@ static utf16 utf16decode_(s16 s)
     return r;
 }
 
+static s16 towide_(arena *perm, s8 s)
+{
+    iz len = 0;
+    utf8 state = {0};
+    state.tail = s;
+    while (state.tail.len) {
+        state = utf8decode_(state.tail);
+        c16 tmp[2];
+        len += utf16encode_(tmp, state.rune);
+    }
+
+    s16 w = {0};
+    w.s = new(perm, c16, len + 1);  // +1 for null terminator
+    state.tail = s;
+    while (state.tail.len) {
+        state = utf8decode_(state.tail);
+        w.len += utf16encode_(w.s + w.len, state.rune);
+    }
+    w.s[w.len] = 0;
+    return w;
+}
+
 static s8 fromwide_(arena *perm, s16 w)
 {
     iz len = 0;
@@ -311,33 +333,8 @@ static i32 os_read(os *ctx, i32 fd, u8 *buf, i32 len)
 
 static b32 os_path_is_dir(arena scratch, s8 path)
 {
-    utf8 state = {0};
-    state.tail = path;
-    
-    // First pass: count required UTF-16 code units dynamically
-    utf8 count_state = state;
-    i32 required_len = 0;
-    while (count_state.tail.len) {
-        count_state = utf8decode_(count_state.tail);
-        if (count_state.rune >= 0x10000) {
-            required_len += 2;  // Surrogate pair
-        } else {
-            required_len += 1;
-        }
-    }
-    
-    // Allocate exactly the required size from scratch arena (+1 for null terminator)
-    c16 *wpath = new(&scratch, c16, required_len + 1);
-    
-    // Convert UTF-8 to UTF-16 dynamically
-    i32 wlen = 0;
-    while (state.tail.len && wlen < required_len) {
-        state = utf8decode_(state.tail);
-        wlen += utf16encode_(wpath + wlen, state.rune);
-    }
-    wpath[wlen] = 0;  // Null terminate
-
-    i32 attr = GetFileAttributesW(wpath);
+    s16 wpath = towide_(&scratch, path);
+    i32 attr = GetFileAttributesW(wpath.s);
     
     if (attr == -1) {
         return 0;  // Path doesn't exist or access denied
@@ -351,45 +348,23 @@ static s8node *os_list_dir(arena *perm, s8 path)
 {
     arena scratch = *perm;
     
-    // Calculate required UTF-16 buffer size for search pattern dynamically
-    utf8 state = {0};
-    state.tail = path;
-    i32 required_len = 0;
+    s16 wbase = towide_(&scratch, path);
     
-    while (state.tail.len) {
-        state = utf8decode_(state.tail);
-        if (state.rune >= 0x10000) {
-            required_len += 2;  // Surrogate pair
-        } else {
-            required_len += 1;
-        }
+    // Extend the allocation for search pattern "/*\0"
+    (void) new(&scratch, c16, 3);
+    
+    // Append search pattern to UTF-16 string
+    if (wbase.len > 0 && wbase.s[wbase.len-1] != L'\\' && wbase.s[wbase.len-1] != L'/') {
+        wbase.s[wbase.len++] = L'/';
     }
-    
-    // Add space for /* pattern and null terminator
-    required_len += 3;
-    
-    c16 *wpath = new(&scratch, c16, required_len);
-    
-    // Convert path to UTF-16
-    state.tail = path;
-    i32 wlen = 0;
-    while (state.tail.len && wlen < required_len - 3) {  // Reserve space for \* and null
-        state = utf8decode_(state.tail);
-        wlen += utf16encode_(wpath + wlen, state.rune);
-    }
-    
-    // Add /* pattern (or just * if path already ends with /)
-    if (wlen > 0 && wpath[wlen-1] != '\\' && wpath[wlen-1] != '/') {
-        wpath[wlen++] = '/';
-    }
-    wpath[wlen++] = '*';
-    wpath[wlen] = 0;  // Null terminate
+    wbase.s[wbase.len++] = L'*';
+    wbase.s[wbase.len] = 0;
     
     // Start directory search
     finddata fd;
-    iptr handle = FindFirstFileW(wpath, &fd);
+    iptr handle = FindFirstFileW(wbase.s, &fd);
     if (handle == INVALID_HANDLE_VALUE) {
-        return 0;  // Directory doesn't exist or can't be read
+        return 0;
     }
     
     s8node *head = 0;
@@ -405,50 +380,33 @@ static s8node *os_list_dir(arena *perm, s8 path)
             continue;
         }
         
-        // Calculate UTF-8 length for filename first
+        // Convert filename from UTF-16 to UTF-8
         s16 wide_name = {fd.name, name_len_w};
-        utf16 state = {0};
-        state.tail = wide_name;
-        iz utf8_filename_len = 0;
-        while (state.tail.len) {
-            state = utf16decode_(state.tail);
-            u8 tmp[4];
-            utf8_filename_len += utf8encode_(tmp, state.rune);
-        }
+        s8 utf8_filename = fromwide_(perm, wide_name);
         
-        if (!utf8_filename_len) continue;  // Skip if conversion fails
+        if (!utf8_filename.len) continue;
         
-        // Calculate full path length
-        iz full_path_len = path.len;
-        if (path.len > 0 && path.s[path.len-1] != '\\' && path.s[path.len-1] != '/') {
-            full_path_len += 1;  // Add separator
-        }
-        full_path_len += utf8_filename_len;
+        // Build full path string once and insert directly in linked list
+        iz separator_needed = (path.len > 0 && path.s[path.len-1] != '\\' && path.s[path.len-1] != '/') ? 1 : 0;
+        iz full_len = path.len + separator_needed + utf8_filename.len;
         
-        // Allocate full path buffer from permanent arena
-        u8 *full_path = new(perm, u8, full_path_len);
+        u8 *full_path = new(perm, u8, full_len);
         
-        // Copy original path
+        // Build the full path string
+        iz pos = 0;
         for (iz i = 0; i < path.len; i++) {
-            full_path[i] = path.s[i];
+            full_path[pos++] = path.s[i];
         }
-        iz pos = path.len;
-        
-        // Add separator if needed
-        if (path.len > 0 && path.s[path.len-1] != '\\' && path.s[path.len-1] != '/') {
+        if (separator_needed) {
             full_path[pos++] = '/';
         }
-        
-        // Convert filename directly into the full path buffer
-        state.tail = wide_name;
-        while (state.tail.len) {
-            state = utf16decode_(state.tail);
-            pos += utf8encode_(full_path + pos, state.rune);
+        for (iz i = 0; i < utf8_filename.len; i++) {
+            full_path[pos++] = utf8_filename.s[i];
         }
         
-        // Create node and allocate from input arena
+        // Insert directly in linked list
         s8node *node = new(perm, s8node, 1);
-        node->str = (s8){full_path, full_path_len};
+        node->str = (s8){full_path, full_len};
         node->next = 0;
         
         *tail = node;
@@ -681,43 +639,71 @@ static b32 os_invoke_editor(os *ctx, arena scratch)
 // Delete a file or directory
 static b32 os_delete_path(os *ctx, arena scratch, s8 path)
 {
-    // Calculate required UTF-16 buffer size
-    utf8 state = {0};
-    state.tail = path;
-    i32 required_len = 0;
-    
-    while (state.tail.len) {
-        state = utf8decode_(state.tail);
-        if (state.rune >= 0x10000) {
-            required_len += 2;  // Surrogate pair
-        } else {
-            required_len += 1;
-        }
-    }
-    
-    // Allocate from temporary arena
-    c16 *wpath = new(&scratch, c16, required_len + 1);
-    
-    // Convert UTF-8 to UTF-16
-    state.tail = path;
-    i32 wlen = 0;
-    while (state.tail.len && wlen < required_len) {
-        state = utf8decode_(state.tail);
-        wlen += utf16encode_(wpath + wlen, state.rune);
-    }
-    wpath[wlen] = 0;  // Null terminate
+    s16 wpath = towide_(&scratch, path);
     
     // Check if it's a directory
-    i32 attr = GetFileAttributesW(wpath);
+    i32 attr = GetFileAttributesW(wpath.s);
     if (attr == -1) {
         return 0;  // File doesn't exist
     }
     
     if (attr & FILE_ATTRIBUTE_DIRECTORY) {
-        return RemoveDirectoryW(wpath) != 0;
+        return RemoveDirectoryW(wpath.s) != 0;
     } else {
-        return DeleteFileW(wpath) != 0;
+        return DeleteFileW(wpath.s) != 0;
     }
+}
+
+// Create directories recursively (like mkdir -p)
+static b32 os_create_dir(os *ctx, arena scratch, s8 path)
+{
+    s16 wpath = towide_(&scratch, path);
+    
+    // Check if directory already exists
+    i32 attr = GetFileAttributesW(wpath.s);
+    if (attr != -1 && (attr & FILE_ATTRIBUTE_DIRECTORY)) {
+        return 1;  // Already exists and is a directory
+    }
+    
+    // Create directories iteratively by null-terminating at each slash
+    for (i32 i = 0; i < wpath.len; i++) {
+        if (wpath.s[i] == L'\\' || wpath.s[i] == L'/') {
+            c16 saved = wpath.s[i];
+            wpath.s[i] = 0;
+            
+            // Skip empty path components and drive letters
+            if (i > 0 && !(i == 2 && wpath.s[1] == L':')) {
+                attr = GetFileAttributesW(wpath.s);
+                if (attr == -1) {
+                    // Directory doesn't exist, create it
+                    if (!CreateDirectoryW(wpath.s, 0)) {
+                        return 0;  // Failed to create
+                    }
+                } else if (!(attr & FILE_ATTRIBUTE_DIRECTORY)) {
+                    return 0;  // Exists but is not a directory
+                }
+            }
+            
+            wpath.s[i] = saved;  // Restore the slash
+        }
+    }
+    
+    // Create final directory if it doesn't exist
+    attr = GetFileAttributesW(wpath.s);
+    if (attr == -1) {
+        return CreateDirectoryW(wpath.s, 0) != 0;
+    }
+    
+    return (attr & FILE_ATTRIBUTE_DIRECTORY) != 0;
+}
+
+// Rename/move a file or directory
+static b32 os_rename_file(os *ctx, arena scratch, s8 src, s8 dst)
+{
+    s16 wsrc = towide_(&scratch, src);
+    s16 wdst = towide_(&scratch, dst);
+    
+    return MoveFileW(wsrc.s, wdst.s) != 0;
 }
 
 
