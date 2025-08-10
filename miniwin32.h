@@ -1,5 +1,5 @@
 // vidir: minimal Win32 API definitions  
-// https://github.com/peter0x44/vidir
+// https://github.com/peter0x44/vidir-c-portable
 // This is free and unencumbered software released into the public domain.
 
 // Platform-specific types (basic types come from vidir.c)

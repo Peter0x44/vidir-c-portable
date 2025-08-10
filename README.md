@@ -6,7 +6,7 @@ A C implementation of vidir from [moreutils](https://joeyh.name/code/moreutils/)
 
 - **Windows XP Compatible**: Uses Win32 API calls compatible with Windows XP and later.
 - **Unicode Support**: Full Unicode support. Editor must support UTF-8.
-- **No CRT Dependency**: Links only against kernel32.dll and shell.dll.
+- **No CRT Dependency**: Links only against kernel32.dll and shell32.dll.
 - **Unity Build System**: Only a single .c file to compile .
 - **Public Domain**: Dedicated to the public domain.
 
@@ -37,9 +37,9 @@ The program respects the following environment variables (in order of preference
 3. Falls back to `notepad.exe`
 
 ## TODO:
-Make above comment true.
-Port platform layer to libc.
-Port platform layer to Linux syscalls.
-Don't always run editors through busybox sh.
-Test on Windows XP. (no theoretical reason this shouldn't work - I just haven't done it.).
-Change relevant asserts to actual failures.
+* Make above comment true.
+* Port platform layer to libc.
+* Port platform layer to Linux syscalls.
+* Don't always run editors through busybox sh.
+* Test on Windows XP. (no theoretical reason this shouldn't work - I just haven't done it.).
+* Change relevant asserts to actual failures.
