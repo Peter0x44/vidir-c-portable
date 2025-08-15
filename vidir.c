@@ -13,7 +13,7 @@ typedef          char    byte;
 
 #define assert(c)     while (!(c)) __builtin_trap()
 #define countof(a)    (iz)(sizeof(a) / sizeof(*(a)))
-#define new(a, t, n)  (t *)alloc(a, sizeof(t), n)
+#define new(a, t, n)  (t *)zalloc(a, sizeof(t), n)
 #define s8(s)         {(u8 *)s, countof(s)-1}
 #define S(s)          (s8)s8(s)
 
@@ -57,6 +57,16 @@ static byte *alloc(arena *a, iz size, iz count)
     }
     void *p = a->beg + pad;
     a->beg += pad + total;
+    return p;
+}
+
+static byte *zalloc(arena *a, iz size, iz count)
+{
+    byte *p = alloc(a, size, count);
+    iz total = size * count;
+    for (iz i = 0; i < total; i++) {
+        p[i] = 0;
+    }
     return p;
 }
 
