@@ -72,46 +72,71 @@ static s8 s8fromcstr(u8 *z)
     }
     return s;
 }
-// Hash with the identity function
-static u32 i32hash(i32 x)
+
+// Operation types for file rename plan
+typedef enum { 
+    OP_DELETE,  // delete src (dst unused)
+    OP_RENAME,  // clobbering move src to dst
+    OP_STASH,   // rename src to the temp name (dst unused)
+    OP_UNSTASH, // rename the temp name to dst (src unused)
+} Op;
+
+typedef struct {
+    Op op;
+    s8 src;
+    s8 dst;
+} Action;
+
+typedef struct {
+    Action *actions;
+    iz      len;
+} Plan;
+
+static u32 s8hash(s8 s)
 {
-    return (u32)x;
+    u32 h = 0x811c9dc5;  // FNV-1a 32-bit offset basis
+    for (iz i = 0; i < s.len; i++) {
+        h ^= s.s[i];
+        h *= 0x01000193;  // FNV-1a 32-bit prime
+    }
+    return h;
 }
 
-// Hash trie mapping line numbers to paths
+static b32 s8equals(s8 a, s8 b)
+{
+    if (a.len != b.len) return 0;
+    for (iz i = 0; i < a.len; i++) {
+        if (a.s[i] != b.s[i]) return 0;
+    }
+    return 1;
+}
 typedef struct pathmap pathmap;
 struct pathmap {
-    pathmap *child[4];   // 4-way trie using bottom 2 bits of the key
-    i32      key;
-    s8       path;
+    pathmap *child[4];   // 4-way trie
+    s8       key;        // the path string
+    i32      value;      // 1-based array index (0 = not found)
 };
 
-// Insert or lookup a path by line number
-static s8 *pathmap_insert(pathmap **m, i32 key, arena *perm)
+// Insert or lookup a path in the map (path -> array index)
+static i32 *pathmap_insert(pathmap **m, s8 key, arena *perm)
 {
-    u32 h = i32hash(key);
-    while (*m) {
-        if ((*m)->key == key) {
-            return &(*m)->path;
+    for (u32 h = s8hash(key); *m; h <<= 2) {
+        if (s8equals((*m)->key, key)) {
+            return &(*m)->value;
         }
-        m = &(*m)->child[h & 0x3];  // Use bottom 2 bits
-        h >>= 2;
+        m = &(*m)->child[h>>30];  // Use top 2 bits
     }
     if (!perm) {
         return 0;  // Not found, don't create
     }
     *m = new(perm, pathmap, 1);
-    (*m)->child[0] = 0;
-    (*m)->child[1] = 0;
-    (*m)->child[2] = 0;
-    (*m)->child[3] = 0;
     (*m)->key = key;
-    (*m)->path = (s8){0}; // Initialize to empty
-    return &(*m)->path;
+    (*m)->value = 0;
+    return &(*m)->value;
 }
 
-// Lookup a path by line number
-static s8 *pathmap_lookup(pathmap **m, i32 key)
+// Lookup a path in the reverse map
+static i32 *pathmap_lookup(pathmap **m, s8 key)
 {
     return pathmap_insert(m, key, 0);
 }
@@ -137,15 +162,6 @@ static s8 dirname_s8(s8 path)
     
     // Return slice of original string up to last slash
     return (s8){path.s, last_slash};
-}
-
-static b32 s8equals(s8 a, s8 b)
-{
-    if (a.len != b.len) return 0;
-    for (iz i = 0; i < a.len; i++) {
-        if (a.s[i] != b.s[i]) return 0;
-    }
-    return 1;
 }
 
 static s8 takehead(s8 s, iz len)
@@ -213,6 +229,104 @@ static s8node *s8sort_(s8node *head)
     }
     *rtail = head ? head : tail;
     return rhead;
+}
+
+static b32  os_path_exists(arena scratch, s8 path);
+
+// File system state tracker to cache OS queries
+typedef struct {
+    pathmap *existing_files;  // Maps path -> 1 if file exists
+    arena *perm;
+} fsstate;
+
+static fsstate *new_fsstate(arena *perm)
+{
+    fsstate *fs = new(perm, fsstate, 1);
+    fs->existing_files = 0;
+    fs->perm = perm;
+    return fs;
+}
+
+static void fsstate_mark_exists(fsstate *fs, s8 path)
+{
+    i32 *exists = pathmap_insert(&fs->existing_files, path, fs->perm);
+    *exists = 1;
+}
+
+static void fsstate_mark_deleted(fsstate *fs, s8 path)
+{
+    i32 *exists = pathmap_insert(&fs->existing_files, path, fs->perm);
+    *exists = 0;
+}
+
+static b32 fsstate_exists(fsstate *fs, s8 path)
+{
+    i32 *exists = pathmap_lookup(&fs->existing_files, path);
+    if (exists) {
+        return *exists != 0;
+    }
+    
+    // First time seeing this path - query OS once and cache result
+    arena scratch = *fs->perm;
+    b32 file_exists = os_path_exists(scratch, path);
+    
+    // Cache the result
+    i32 *cached = pathmap_insert(&fs->existing_files, path, fs->perm);
+    *cached = file_exists ? 1 : 0;
+    
+    return file_exists;
+}
+
+// Generate a unique non-conflicting name for a file
+static s8 fsstate_unique_name(fsstate *fs, s8 base_path)
+{
+    if (!fsstate_exists(fs, base_path)) {
+        return base_path;  // No conflict
+    }
+    
+    // Try base_path~, base_path~1, base_path~2, etc.
+    iz max_len = base_path.len + 20;  // Room for ~999999...
+    u8 *candidate = new(fs->perm, u8, max_len);
+    
+    // Copy base path
+    for (iz i = 0; i < base_path.len; i++) {
+        candidate[i] = base_path.s[i];
+    }
+    candidate[base_path.len] = '~';
+    
+    s8 candidate_path = {candidate, base_path.len + 1};
+    if (!fsstate_exists(fs, candidate_path)) {
+        return candidate_path;
+    }
+    
+    // Try with numbers
+    for (i32 counter = 1; ; counter++) {
+        iz pos = base_path.len + 1;
+        i32 temp_counter = counter;
+        
+        // Convert counter to digits
+        u8 digits[16];
+        iz digit_count = 0;
+        do {
+            digits[digit_count++] = '0' + (temp_counter % 10);
+            temp_counter /= 10;
+        } while (temp_counter > 0);
+        
+        // Copy digits in correct order
+        for (iz i = 0; i < digit_count; i++) {
+            candidate[pos + i] = digits[digit_count - 1 - i];
+        }
+        
+        candidate_path.len = pos + digit_count;
+        if (!fsstate_exists(fs, candidate_path)) {
+            return candidate_path;
+        }
+        
+        // Prevent overflow
+        if (counter == 0x7fffffff) {  // INT32_MAX
+            return base_path;  // Just give up...
+        }
+    }
 }
 
 static void os_write(os *, i32 fd, s8);
@@ -306,6 +420,19 @@ typedef struct {
     b32    eof;
 } u8input;
 
+// Parse the temporary file into an array of names. Returns an array of exactly
+// original_name_count items. Missing items (to be deleted) are null.
+static s8 *parse_temp_file(arena *perm, u8input *input, iz original_name_count);
+
+// Produce a sequence of operations necessary to achieve the new name set.
+static Plan compute_plan(arena *perm, s8 *oldnames, s8 *newnames, iz num_names);
+
+// Execute the plan 
+static b32 execute_plan(Plan plan, arena scratch, os *ctx, u8buf *out, u8buf *err, b32 verbose);
+
+// Parse a line from temp file: "number\tpath"
+static b32 parse_temp_line(s8 *line, i32 *line_number);
+
 static u8input *newinput(arena *perm, i32 fd, iz cap)
 {
     u8input *b = new(perm, u8input, 1);
@@ -385,8 +512,409 @@ static s8 nextline(u8input *b)
     }
     
     // No more data
-    s8 empty = {0};
-    return empty;
+    return (s8){0};
+}
+
+// Parse the temporary file into an array of names. Returns an array of exactly
+// original_name_count items. Missing items (to be deleted) are null.
+static s8 *parse_temp_file(arena *perm, u8input *input, iz original_name_count)
+{
+    s8 *names = new(perm, s8, original_name_count);
+    
+    for (;;) {
+        s8 line = nextline(input);
+        if (line.len == 0 && line.s == 0) break;  // EOF
+        
+        // Skip empty lines
+        if (line.len == 0) continue;
+        
+        i32 parsed_line_num;
+        s8 line_copy = line;
+        if (!parse_temp_line(&line_copy, &parsed_line_num)) {
+            // Unable to parse line - this is fatal in strict mode (like Perl vidir)
+            assert(0 && "vidir: unable to parse line, aborting");
+        }
+        
+        // Check if line number is in valid range [1, original_name_count]
+        if (parsed_line_num < 1 || parsed_line_num > original_name_count) {
+            // Invalid line number - this is fatal in strict mode (like Perl vidir)
+            assert(0 && "vidir: unknown item number");
+        }
+        
+        // Copy the path to permanent memory
+        u8 *path_copy = new(perm, u8, line_copy.len + 1);
+        for (iz i = 0; i < line_copy.len; i++) {
+            path_copy[i] = line_copy.s[i];
+        }
+        path_copy[line_copy.len] = 0;  // null terminate
+        
+        // Store in the array (convert to 0-based index)
+        names[parsed_line_num - 1] = (s8){path_copy, line_copy.len};
+    }
+    
+    return names;
+}
+
+// Produce a sequence of operations necessary to achieve the new name set.
+static Plan compute_plan(arena *perm, s8 *oldnames, s8 *newnames, iz num_names)
+{
+    Plan plan = {0};
+    
+    // Create filesystem state tracker
+    fsstate *fs = new_fsstate(perm);
+    
+    // Initialize with all original files
+    for (iz i = 0; i < num_names; i++) {
+        fsstate_mark_exists(fs, oldnames[i]);
+    }
+
+    // Create reverse map: newname -> old index (for detecting cycles)
+    pathmap *newname_map = 0;
+    for (iz i = 0; i < num_names; i++) {
+        if (newnames[i].s && newnames[i].len > 0) {
+            i32 *old_idx = pathmap_insert(&newname_map, newnames[i], perm);
+            *old_idx = (i32)(i + 1);  // Store 1-based index (0 means not found)
+        }
+    }
+    
+    // Resolve conflicts deterministically by generating unique names upfront
+    s8 *resolved_names = new(perm, s8, num_names);
+    for (iz i = 0; i < num_names; i++) {
+        if (!newnames[i].s || newnames[i].len == 0) {
+            resolved_names[i] = (s8){0}; // Mark for deletion
+        } else if (s8equals(oldnames[i], newnames[i])) {
+            // No change - use original name as-is
+            resolved_names[i] = newnames[i];
+        } else {
+            // This is a rename - check if destination conflicts with existing files
+            // But not with other files in our rename set (those are cycles, not conflicts)
+            
+            // Check if destination exists in filesystem AND is not one of our source files
+            b32 is_filesystem_conflict = fsstate_exists(fs, newnames[i]);
+            b32 is_our_source_file = 0;
+            for (iz j = 0; j < num_names; j++) {
+                if (s8equals(newnames[i], oldnames[j])) {
+                    is_our_source_file = 1;
+                    break;
+                }
+            }
+            
+            if (is_filesystem_conflict && !is_our_source_file) {
+                // Real conflict with existing filesystem entry - generate unique name
+                resolved_names[i] = fsstate_unique_name(fs, newnames[i]);
+                fsstate_mark_exists(fs, resolved_names[i]);
+            } else {
+                // No real conflict (either destination is free, or it's a cycle) - use original destination
+                resolved_names[i] = newnames[i];
+                fsstate_mark_exists(fs, resolved_names[i]);
+            }
+        }
+    }
+    
+    // Count operations needed
+    iz action_count = 0;
+    for (iz i = 0; i < num_names; i++) {
+        if (!resolved_names[i].s || resolved_names[i].len == 0) {
+            // This item should be deleted
+            action_count++;
+        } else if (!s8equals(oldnames[i], resolved_names[i])) {
+            // This item is being renamed
+            i32 *conflict_idx = pathmap_lookup(&newname_map, oldnames[i]);
+            if (conflict_idx && *conflict_idx > 0 && (*conflict_idx - 1) != i) {
+                // There's a cycle - we need stash/unstash
+                action_count += 3;  // STASH, RENAME, UNSTASH
+            } else {
+                action_count++;  // Simple RENAME
+            }
+        }
+    }
+    
+    plan.actions = new(perm, Action, action_count);
+    plan.len = 0;
+    
+    // Track which items have been processed to handle cycles
+    b32 *processed = new(perm, b32, num_names);
+    for (iz i = 0; i < num_names; i++) {
+        processed[i] = 0;
+    }
+    
+    // First pass: handle simple renames and start cycles
+    for (iz i = 0; i < num_names; i++) {
+        if (processed[i]) continue;
+        
+        if (!resolved_names[i].s || resolved_names[i].len == 0) {
+            // Delete item
+            plan.actions[plan.len++] = (Action){OP_DELETE, oldnames[i], {0}};
+            processed[i] = 1;
+        } else if (!s8equals(oldnames[i], resolved_names[i])) {
+            // Rename item (resolved_names[i] is valid and different from oldnames[i])
+            // Check if this creates a cycle by following the chain
+            i32 *conflict_idx = pathmap_lookup(&newname_map, oldnames[i]);
+            if (conflict_idx && *conflict_idx > 0 && (*conflict_idx - 1) != i) {
+                // Potential cycle detected - follow the chain to find all participants
+                iz cycle_start = i;
+                iz cycle_length = 0;
+                iz *cycle_nodes = new(perm, iz, num_names);  // Allocate enough for worst case
+                iz current = i;
+                
+                // Follow the cycle chain in the forward direction (where each file wants to go)
+                do {
+                    if (cycle_length >= num_names) {
+                        // Cycle too long (shouldn't happen with valid input) - fall back to 2-element handling
+                        cycle_length = 0;
+                        break;
+                    }
+                    cycle_nodes[cycle_length++] = current;
+                    
+                    // Find where current file wants to go (forward direction)
+                    s8 current_destination = newnames[current];
+                    if (!current_destination.s || current_destination.len == 0) {
+                        // This file is being deleted, not part of rename cycle
+                        cycle_length = 0;
+                        break;
+                    }
+                    
+                    // Find which file currently occupies that destination
+                    iz next_file = -1;
+                    for (iz j = 0; j < num_names; j++) {
+                        if (s8equals(oldnames[j], current_destination)) {
+                            next_file = j;
+                            break;
+                        }
+                    }
+                    
+                    if (next_file == -1) {
+                        // Destination is not one of our files - not a cycle
+                        cycle_length = 0;
+                        break;
+                    }
+                    
+                    current = next_file;
+                } while (current != cycle_start && cycle_length < num_names);
+                
+                if (cycle_length > 1 && current == cycle_start) {
+                    // Complete cycle found! Handle it properly
+                    // For cycle A→B→C→A, we need: stash A, move C→A, move B→C, unstash A→B
+                    
+                    // Stash the first file to break the cycle
+                    iz stash_file = cycle_nodes[0];
+                    plan.actions[plan.len++] = (Action){OP_STASH, oldnames[stash_file], {0}};
+                    processed[stash_file] = 1;
+                    
+                    // Perform renames in reverse order (last file in cycle moves first)
+                    for (iz j = cycle_length - 1; j >= 1; j--) {
+                        iz from_file = cycle_nodes[j];
+                        iz to_file = cycle_nodes[j - 1];  
+                        plan.actions[plan.len++] = (Action){OP_RENAME, oldnames[from_file], oldnames[to_file]};
+                        processed[from_file] = 1;
+                    }
+                    
+                    // Unstash the first file to complete the cycle (to where the last file was)
+                    iz final_dest_file = cycle_nodes[cycle_length - 1];
+                    plan.actions[plan.len++] = (Action){OP_UNSTASH, {0}, oldnames[final_dest_file]};
+                    
+                } else {
+                    // No complete cycle detected - handle as simple rename
+                    plan.actions[plan.len++] = (Action){OP_RENAME, oldnames[i], resolved_names[i]};
+                    processed[i] = 1;
+                }
+            } else {
+                // Simple rename
+                plan.actions[plan.len++] = (Action){OP_RENAME, oldnames[i], resolved_names[i]};
+                processed[i] = 1;
+            }
+        } else {
+            // No change needed
+            processed[i] = 1;
+        }
+    }
+    
+    return plan;
+}
+
+// Execute the plan 
+static b32 execute_plan(Plan plan, arena scratch, os *ctx, u8buf *out, u8buf *err, b32 verbose)
+{
+    b32 has_errors = 0;
+    s8 stash_name = {0};  // Track stashed file name
+#if 0
+    // Debug: print all actions
+    for (iz i = 0; i < plan.len; i++) {
+        Action *action = &plan.actions[i];
+        prints8(err, S("DEBUG ACTION["));
+        printi64(err, i);
+        prints8(err, S("]: op="));
+        printi64(err, action->op);
+        prints8(err, S(" src='"));
+        prints8(err, action->src);
+        prints8(err, S("' dst_ptr=0x"));
+        printi64(err, (i64)action->dst.s);
+        prints8(err, S(" dst_len="));
+        printi64(err, action->dst.len);
+        prints8(err, S(" dst='"));
+        if (action->dst.s && action->dst.len > 0) {
+            prints8(err, action->dst);
+        } else {
+            prints8(err, S("(null/empty)"));
+        }
+        prints8(err, S("'\n"));
+    }
+    flush(err);
+#endif
+
+    for (iz i = 0; i < plan.len; i++) {
+        Action *action = &plan.actions[i];
+        
+        switch (action->op) {
+        case OP_DELETE:
+            if (!os_delete_path(ctx, scratch, action->src)) {
+                prints8(err, S("vidir: failed to remove "));
+                prints8(err, action->src);
+                prints8(err, S("\n"));
+                has_errors = 1;
+            } else if (verbose) {
+                prints8(out, S("removed '"));
+                prints8(out, action->src);
+                prints8(out, S("'\n"));
+            }
+            break;
+            
+        case OP_RENAME:
+            // Debug: check if dst is empty
+            if (!action->dst.s || action->dst.len == 0) {
+                prints8(err, S("vidir: DEBUG - empty destination path for src: "));
+                prints8(err, action->src);
+                prints8(err, S("\n"));
+                has_errors = 1;
+                break;
+            }
+            
+            // Create destination directory if needed
+            {
+                s8 dst_dir = dirname_s8(action->dst);
+                if (!s8equals(dst_dir, S(".")) && !os_path_is_dir(scratch, dst_dir)) {
+                    if (!os_create_dir(ctx, scratch, dst_dir)) {
+                        prints8(err, S("vidir: failed to create directory tree '"));
+                        prints8(err, dst_dir);
+                        prints8(err, S("' for destination '"));
+                        prints8(err, action->dst);
+                        prints8(err, S("'\n"));
+                        has_errors = 1;
+                        break;
+                    }
+                }
+            }
+            
+            // Perform the rename (conflicts already resolved during planning)
+            if (!os_rename_file(ctx, scratch, action->src, action->dst)) {
+                prints8(err, S("vidir: failed to rename "));
+                prints8(err, action->src);
+                prints8(err, S(" to "));
+                prints8(err, action->dst);
+                prints8(err, S("\n"));
+                has_errors = 1;
+            } else if (verbose) {
+                prints8(out, S("'"));
+                prints8(out, action->src);
+                prints8(out, S("' => '"));
+                prints8(out, action->dst);
+                prints8(out, S("'\n"));
+            }
+            break;
+            
+        case OP_STASH:
+            // Generate unique stash name
+            {
+                iz stash_len = action->src.len + 20;  // Room for .vidir_stash_123456
+                u8 *stash_buf = new(&scratch, u8, stash_len);
+                iz pos = 0;
+                for (iz j = 0; j < action->src.len; j++) {
+                    stash_buf[pos++] = action->src.s[j];
+                }
+                s8 suffix = S(".vidir_stash");
+                for (iz j = 0; j < suffix.len; j++) {
+                    stash_buf[pos++] = suffix.s[j];
+                }
+                
+                i32 counter = 0;
+                stash_name = (s8){stash_buf, pos};
+                
+                while (os_path_exists(scratch, stash_name)) {
+                    counter++;
+                    pos = action->src.len + suffix.len;
+                    i32 temp_counter = counter;
+                    u8 digits[16];
+                    iz digit_count = 0;
+                    
+                    do {
+                        digits[digit_count++] = '0' + (temp_counter % 10);
+                        temp_counter /= 10;
+                    } while (temp_counter > 0);
+                    
+                    for (iz j = 0; j < digit_count; j++) {
+                        stash_buf[pos + j] = digits[digit_count - 1 - j];
+                    }
+                    stash_name.len = pos + digit_count;
+                }
+            }
+            
+            if (!os_rename_file(ctx, scratch, action->src, stash_name)) {
+                prints8(err, S("vidir: failed to stash "));
+                prints8(err, action->src);
+                prints8(err, S(" to "));
+                prints8(err, stash_name);
+                prints8(err, S("\n"));
+                has_errors = 1;
+            } else if (verbose) {
+                prints8(out, S("stashed '"));
+                prints8(out, action->src);
+                prints8(out, S("' -> '"));
+                prints8(out, stash_name);
+                prints8(out, S("'\n"));
+            }
+            break;
+            
+        case OP_UNSTASH:
+            if (!stash_name.s) {
+                prints8(err, S("vidir: internal error - no stash to unstash\n"));
+                has_errors = 1;
+                break;
+            }
+            
+            // Create destination directory if needed
+            {
+                s8 dst_dir = dirname_s8(action->dst);
+                if (!s8equals(dst_dir, S(".")) && !os_path_is_dir(scratch, dst_dir)) {
+                    if (!os_create_dir(ctx, scratch, dst_dir)) {
+                        prints8(err, S("vidir: failed to create directory tree "));
+                        prints8(err, dst_dir);
+                        prints8(err, S("\n"));
+                        has_errors = 1;
+                        break;
+                    }
+                }
+            }
+            
+            if (!os_rename_file(ctx, scratch, stash_name, action->dst)) {
+                prints8(err, S("vidir: failed to unstash "));
+                prints8(err, stash_name);
+                prints8(err, S(" to "));
+                prints8(err, action->dst);
+                prints8(err, S("\n"));
+                has_errors = 1;
+            } else if (verbose) {
+                prints8(out, S("unstashed '"));
+                prints8(out, stash_name);
+                prints8(out, S("' => '"));
+                prints8(out, action->dst);
+                prints8(out, S("'\n"));
+            }
+            stash_name = (s8){0};  // Clear stash name
+            break;
+        }
+    }
+    
+    return !has_errors;
 }
 
 // Parse a line from temp file: "number\tpath"
@@ -450,9 +978,6 @@ static void vidir(config *conf)
     u8input *input = newinput(perm, 3, 4096);  // reading back from temp file
     u8input *stdin_input = newinput(perm, 0, 4096); // stdin reading
     
-    // Hash trie to store original paths indexed by line number
-    pathmap *original_paths = 0;
-    
     s8 *paths = 0;
     i32 paths_count = 0;
 
@@ -498,7 +1023,6 @@ static void vidir(config *conf)
 
     // Read from stdin if requested
     if (read_from_stdin) {
-        
         for (;;) {
             s8 line = nextline(stdin_input);
             if (line.len == 0 && line.s == 0) break;  // EOF (null pointer)
@@ -566,9 +1090,10 @@ static void vidir(config *conf)
     paths = final_paths;
     paths_count = final_count;
 
-    // Write paths to temporary file in vidir format
-    // <number>\t<name>\n
-    i32 item_count = 0;
+    // Filter out . and .. entries and write to temporary file
+    s8 *original_names = new(perm, s8, paths_count);
+    i32 original_name_count = 0;
+    
     for (i32 i = 0; i < paths_count; i++) {
         s8 path = paths[i];
         s8 basename = path;
@@ -586,13 +1111,10 @@ static void vidir(config *conf)
             continue;
         }
         
-        item_count++;
+        original_names[original_name_count] = path;
+        original_name_count++;
         
-        // Store the original path using pathmap (line numbers start at 1)
-        s8 *stored_path = pathmap_insert(&original_paths, item_count, perm);
-        *stored_path = path;
-        
-        printi64(tmp, item_count);
+        printi64(tmp, original_name_count);
         prints8(tmp, S("\t"));
         prints8(tmp, path);
         prints8(tmp, S("\n"));
@@ -614,213 +1136,21 @@ static void vidir(config *conf)
     // Reopen temp file for reading
     os_open_temp_file(perm->ctx);
     
-    b32 has_errors = 0;
-        
-    // Parse all lines from temp file and process operations
-    for (;;) {
-        s8 line = nextline(input);
-        if (line.len == 0 && line.s == 0) break;  // EOF
-        
-        // Skip empty lines
-        if (line.len == 0) continue;
-        
-        i32 parsed_line_num;
-        s8 line_copy = line;
-        if (!parse_temp_line(&line_copy, &parsed_line_num)) {
-            // Unable to parse line - this is an error
-            prints8(err, S("vidir: unable to parse line \""));
-            // Safely print the line - replace any control characters
-            for (iz i = 0; i < line.len; i++) {
-                if (line.s[i] >= 32 && line.s[i] <= 126) {
-                    u8 c = line.s[i];
-                    prints8(err, (s8){&c, 1});
-                } else {
-                    prints8(err, S("?"));
-                }
-            }
-            prints8(err, S("\", aborting\n"));
-            has_errors = 1;
-            flush(err);
-            return;
-        }
-        
-        // Look up the original path for this line number
-        s8 *original_path = pathmap_lookup(&original_paths, parsed_line_num);
-        if (!original_path) {
-            prints8(err, S("vidir: unknown item number "));
-            printi64(err, parsed_line_num);
-            prints8(err, S("\n"));
-            has_errors = 1;
-            flush(err);
-            return;
-        }
-        
-        s8 src = *original_path;
-        s8 dst = line_copy;  // After parse_temp_line, this contains just the path
-        
-        // Check if the source file still exists
-        if (!s8equals(src, dst)) {  // Only check if we're doing an operation
-            if (dst.len == 0) {
-                // This is deletion, don't check existence
-            } else if (!os_path_exists(scratch, src)) {
-                prints8(err, S("vidir: "));
-                prints8(err, src);
-                prints8(err, S(" does not exist\n"));
-                // Mark this item as processed by clearing it
-                *original_path = (s8){0};
-                continue;
-            }
-        }
-        
-        if (!s8equals(src, dst)) {
-            if (dst.len == 0) {
-                // Skip deletion for now - we'll handle it at the end
-            } else {
-                // Handle swaps: if destination exists and matches one of our items
-                if (os_path_exists(scratch, dst)) {
-                    // Generate a unique temporary name
-                    u8 *temp_name = new(perm, u8, dst.len + 10);
-                    for (iz i = 0; i < dst.len; i++) {
-                        temp_name[i] = dst.s[i];
-                    }
-                    temp_name[dst.len] = '~';
-                    s8 temp_path = {temp_name, dst.len + 1};
-                    
-                    i32 counter = 0;
-                    while (os_path_exists(scratch, temp_path)) {
-                        counter++;
-                        // Rebuild temp path with counter
-                        iz pos = dst.len + 1;
-                        i32 temp_counter = counter;
-                        u8 digits[16];
-                        iz digit_count = 0;
-                        
-                        do {
-                            digits[digit_count++] = '0' + (temp_counter % 10);
-                            temp_counter /= 10;
-                        } while (temp_counter > 0);
-                        
-                        // Reverse digits and copy
-                        for (iz i = 0; i < digit_count; i++) {
-                            temp_name[pos + i] = digits[digit_count - 1 - i];
-                        }
-                        temp_path.len = pos + digit_count;
-                    }
-                    
-                    if (!os_rename_file(perm->ctx, scratch, dst, temp_path)) {
-                        prints8(err, S("vidir: failed to rename "));
-                        prints8(err, dst);
-                        prints8(err, S(" to "));
-                        prints8(err, temp_path);
-                        prints8(err, S("\n"));
-                        has_errors = 1;
-                    } else {
-                        if (verbose) {
-                            prints8(out, S("'"));
-                            prints8(out, dst);
-                            prints8(out, S("' -> '"));
-                            prints8(out, temp_path);
-                            prints8(out, S("'\n"));
-                        }
-                        
-                        // Update any items that pointed to the old destination
-                        for (i32 j = 1; j <= item_count; j++) {
-                            s8 *check_path = pathmap_lookup(&original_paths, j);
-                            if (check_path && s8equals(*check_path, dst)) {
-                                // Copy temp_path to permanent memory
-                                u8 *perm_path = new(perm, u8, temp_path.len);
-                                for (iz k = 0; k < temp_path.len; k++) {
-                                    perm_path[k] = temp_path.s[k];
-                                }
-                                *check_path = (s8){perm_path, temp_path.len};
-                            }
-                        }
-                    }
-                }
-                
-                // Create destination directory if needed
-                s8 dst_dir = dirname_s8(dst);
-                if (!s8equals(dst_dir, S(".")) && !os_path_is_dir(scratch, dst_dir)) {
-                    if (!os_create_dir(perm->ctx, scratch, dst_dir)) {
-                        prints8(err, S("vidir: failed to create directory tree "));
-                        prints8(err, dst_dir);
-                        prints8(err, S("\n"));
-                        has_errors = 1;
-                    }
-                }
-                
-                // Perform the rename
-                if (!os_rename_file(perm->ctx, scratch, src, dst)) {
-                    prints8(err, S("vidir: failed to rename "));
-                    prints8(err, src);
-                    prints8(err, S(" to "));
-                    prints8(err, dst);
-                    prints8(err, S("\n"));
-                    has_errors = 1;
-                } else {
-                    if (verbose) {
-                        prints8(out, S("'"));
-                        prints8(out, src);
-                        prints8(out, S("' => '"));
-                        prints8(out, dst);
-                        prints8(out, S("'\n"));
-                    }
-                    
-                    // If we renamed a directory, update all items that were inside it
-                    if (os_path_is_dir(scratch, dst)) {
-                        for (i32 j = 1; j <= item_count; j++) {
-                            s8 *check_path = pathmap_lookup(&original_paths, j);
-                            if (check_path && check_path->len > src.len) {
-                                // Check if this path starts with src/ 
-                                b32 is_subpath = 1;
-                                for (iz k = 0; k < src.len && is_subpath; k++) {
-                                    if (check_path->s[k] != src.s[k]) {
-                                        is_subpath = 0;
-                                    }
-                                }
-                                if (is_subpath && (check_path->s[src.len] == '/' || check_path->s[src.len] == '\\')) {
-                                    // This item is inside the moved directory
-                                    iz suffix_len = check_path->len - src.len;
-                                    u8 *new_path = new(perm, u8, dst.len + suffix_len);
-                                    for (iz k = 0; k < dst.len; k++) {
-                                        new_path[k] = dst.s[k];
-                                    }
-                                    for (iz k = 0; k < suffix_len; k++) {
-                                        new_path[dst.len + k] = check_path->s[src.len + k];
-                                    }
-                                    *check_path = (s8){new_path, dst.len + suffix_len};
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        
-        // Mark this item as processed by clearing its pathmap entry
-        *original_path = (s8){0, 0};
-    }
+    // Parse the temp file into the new names array
+    s8 *new_names = parse_temp_file(perm, input, original_name_count);
     
-    // Now handle remaining items (these should be deleted)
-    for (i32 i = 1; i <= item_count; i++) {
-        
-        s8 *path = pathmap_lookup(&original_paths, i);
-        if (path && path->len > 0 && path->s) {  // Item was not processed, so it should be deleted
-            if (!os_delete_path(perm->ctx, scratch, *path)) {
-                prints8(err, S("vidir: failed to remove "));
-                prints8(err, *path);
-                prints8(err, S("\n"));
-                has_errors = 1;
-            } else {
-                if (verbose) {
-                    prints8(out, S("removed '"));
-                    prints8(out, *path);
-                    prints8(out, S("'\n"));
-                }
-            }
-        }
-    }
+    // Compute the plan
+    Plan plan = compute_plan(perm, original_names, new_names, original_name_count);
+    
+    // Execute the plan
+    scratch = *perm;
+    scratch.beg = perm->beg;  // Start scratch from current position, don't overlap permanent data
+    b32 success = execute_plan(plan, scratch, perm->ctx, out, err, verbose);
     
     flush(out);
     flush(err);
+    
+    if (!success) {
+        // TODO: Could set exit code here
+    }
 }
