@@ -2,6 +2,16 @@
 """
 Simple vidir test suite using relative paths and a temporary test directory.
 This avoids all Windows path conversion issues by working entirely with relative paths.
+
+Usage:
+    python3 test_vidir.py [--vidir=vidir_command] [--python=python_command]
+    
+Examples:
+    python3 test_vidir.py                                 # Use system vidir with python
+    python3 test_vidir.py --vidir=./vidir.exe             # Use Windows C implementation with python
+    python3 test_vidir.py --vidir=/path/to/vidir          # Use specific vidir binary with python
+    python3 test_vidir.py --python=python                 # Use system vidir with python
+    python3 test_vidir.py --vidir=./vidir.exe --python=py # Use specific vidir with py command
 """
 
 import os
@@ -11,7 +21,7 @@ import shutil
 import sys
 import re
 
-def create_fake_editor(test_dir, operations_code):
+def create_fake_editor(test_dir, operations_code, python_command="python"):
     """Create a simple fake editor script that performs the specified operations."""
     editor_script = os.path.join(test_dir, "fake_editor.py")
     
@@ -34,9 +44,9 @@ with open(sys.argv[1], 'w') as f:
     
     # Convert to forward slashes for busybox compatibility
     editor_script_unix = editor_script.replace("\\", "/")
-    return f"python {editor_script_unix}"
+    return f"{python_command} {editor_script_unix}"
 
-def run_vidir_test(test_name, setup_files, editor_operations, expected_files, vidir_args=None):
+def run_vidir_test(test_name, setup_files, editor_operations, expected_files, vidir_args=None, vidir_command="vidir", python_command="python3"):
     """Run a single vidir test."""
     print(f"\n=== Testing: {test_name} ===")
     
@@ -59,7 +69,7 @@ def run_vidir_test(test_name, setup_files, editor_operations, expected_files, vi
                 f.write(content)
         
         # Create fake editor
-        editor_cmd = create_fake_editor(".", editor_operations)
+        editor_cmd = create_fake_editor(".", editor_operations, python_command)
         
         # Run vidir
         env = os.environ.copy()
@@ -69,10 +79,12 @@ def run_vidir_test(test_name, setup_files, editor_operations, expected_files, vi
         if vidir_args is None:
             vidir_args = ["."]
         
-        # Get absolute path to vidir.exe in parent directory
-        script_dir = os.path.dirname(os.path.abspath(__file__))
-        vidir_exe = os.path.join(os.path.dirname(script_dir), "vidir.exe")
-        cmd = [vidir_exe] + vidir_args
+        # Use the specified vidir command
+        if isinstance(vidir_command, str):
+            cmd = [vidir_command] + vidir_args
+        else:
+            cmd = vidir_command + vidir_args
+        
         result = subprocess.run(cmd, env=env, capture_output=True, text=True)
         
         print(f"Return code: {result.returncode}")
@@ -109,6 +121,27 @@ def run_vidir_test(test_name, setup_files, editor_operations, expected_files, vi
 
 def main():
     """Run all vidir tests."""
+    # Parse command line arguments
+    vidir_command = "vidir"
+    python_command = "python3"
+    
+    # Parse arguments
+    args = sys.argv[1:]
+    
+    for arg in args:
+        if arg.startswith("--vidir="):
+            vidir_command = arg.split("=", 1)[1]
+        elif arg.startswith("--python="):
+            python_command = arg.split("=", 1)[1]
+        else:
+            print(f"Error: Unknown argument '{arg}'. Use --vidir=command or --python=command")
+            return 1
+    
+ 
+    print(f"Testing vidir command: {vidir_command}")
+    
+    print(f"Using Python command: {python_command}")
+    
     tests_passed = 0
     tests_total = 0
     
@@ -118,7 +151,9 @@ def main():
         "Simple Rename",
         {"file1.txt": "content1", "file2.txt": "content2"},
         'content = content.replace("file1.txt", "renamed.txt")',
-        ["renamed.txt", "file2.txt"]
+        ["renamed.txt", "file2.txt"],
+        vidir_command=vidir_command,
+        python_command=python_command
     ):
         tests_passed += 1
     
@@ -128,7 +163,9 @@ def main():
         "Delete File", 
         {"file1.txt": "content1", "file2.txt": "content2"},
         'content = "\\n".join(line for line in content.split("\\n") if "file1.txt" not in line)',
-        ["file2.txt"]
+        ["file2.txt"],
+        vidir_command=vidir_command,
+        python_command=python_command
     ):
         tests_passed += 1
     
@@ -138,7 +175,9 @@ def main():
         "Rename to Subdirectory",
         {"file1.txt": "content1", "file2.txt": "content2"},
         'content = content.replace("file1.txt", "subdir/file1.txt")',
-        ["subdir/file1.txt", "file2.txt"]
+        ["subdir/file1.txt", "file2.txt"],
+        vidir_command=vidir_command,
+        python_command=python_command
     ):
         tests_passed += 1
     
@@ -149,7 +188,9 @@ def main():
         {"dir1/file1.txt": "content1", "file2.txt": "content2"},
         'content = content.replace("dir1/file1.txt", "moved_file.txt")',
         ["moved_file.txt", "file2.txt"],
-        ["dir1", "file2.txt"]  # Tell vidir to process dir1 and file2.txt explicitly
+        ["dir1", "file2.txt"],  # Tell vidir to process dir1 and file2.txt explicitly
+        vidir_command,
+        python_command
     ):
         tests_passed += 1
     
@@ -170,7 +211,9 @@ for line in lines:
         new_lines.append(line)
 content = "\\n".join(new_lines) + "\\n"
         ''',
-        ["fileA.txt", "fileB.txt"]  # Files should be swapped
+        ["fileA.txt", "fileB.txt"],  # Files should be swapped
+        vidir_command=vidir_command,
+        python_command=python_command
     ):
         tests_passed += 1
     
@@ -189,7 +232,9 @@ content = content.replace("dir1/", "dir2/")
 content = content.replace("dir2/", "dir3/")
         ''',
         ["dir3/file1.txt", "dir3/file2.txt", "dir3/file3.txt"],
-        ["dir1", "dir2"]  # Tell vidir to process dir1 and dir2 explicitly
+        ["dir1", "dir2"],  # Tell vidir to process dir1 and dir2 explicitly
+        vidir_command,
+        python_command
     ):
         tests_passed += 1
 
@@ -199,7 +244,9 @@ content = content.replace("dir2/", "dir3/")
         "Create New Directories",
         {"file1.txt": "content1", "file2.txt": "content2"},
         'content = content.replace("file1.txt", "newdir/subdir/file1.txt")',
-        ["newdir/subdir/file1.txt", "file2.txt"]
+        ["newdir/subdir/file1.txt", "file2.txt"],
+        vidir_command=vidir_command,
+        python_command=python_command
     ):
         tests_passed += 1
 
@@ -223,7 +270,9 @@ lines = content.strip().split("\\n")
 lines = [line for line in lines if not line.endswith("d.txt")]
 content = "\\n".join(lines) + "\\n"
         ''',
-        ["renamed_a.txt", "subdir1/b.txt", "subdir2/renamed_c.txt"]
+        ["renamed_a.txt", "subdir1/b.txt", "subdir2/renamed_c.txt"],
+        vidir_command=vidir_command,
+        python_command=python_command
     ):
         tests_passed += 1
 
@@ -234,7 +283,9 @@ content = "\\n".join(lines) + "\\n"
         {"deep/nested/path/file.txt": "deep_content"},
         'content = content.replace("deep/nested", "very/deeply/nested")',
         ["very/deeply/nested/path/file.txt"],
-        ["deep"]
+        ["deep"],
+        vidir_command,
+        python_command
     ):
         tests_passed += 1
 
@@ -263,7 +314,9 @@ content = "\\n".join(lines) + "\\n"
             "project/code/main.py", 
             "project/documentation/readme.md"
         ],
-        ["standalone.txt", "project", "temp"]
+        ["standalone.txt", "project", "temp"],
+        vidir_command,
+        python_command
     ):
         tests_passed += 1
     
