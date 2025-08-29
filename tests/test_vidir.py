@@ -137,6 +137,9 @@ def main():
             print(f"Error: Unknown argument '{arg}'. Use --vidir=command or --python=command")
             return 1
     
+    # Convert relative paths to absolute paths so they work from any directory
+    if vidir_command != "vidir" and not os.path.isabs(vidir_command):
+        vidir_command = os.path.abspath(vidir_command)
  
     print(f"Testing vidir command: {vidir_command}")
     
