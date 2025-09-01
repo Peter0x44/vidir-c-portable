@@ -46,7 +46,7 @@ with open(sys.argv[1], 'w') as f:
     editor_script_unix = editor_script.replace("\\", "/")
     return f"{python_command} {editor_script_unix}"
 
-def run_vidir_test(test_name, setup_files, editor_operations, expected_files, vidir_args=None, vidir_command="vidir", python_command="python3"):
+def run_vidir_test(test_name, setup_files, editor_operations, expected_files, vidir_args=None, vidir_command="vidir", python_command="python3", expected_contents=None):
     """Run a single vidir test."""
     print(f"\n=== Testing: {test_name} ===")
     
@@ -104,14 +104,34 @@ def run_vidir_test(test_name, setup_files, editor_operations, expected_files, vi
         
         expected_set = set(expected_files)
         
-        if actual_files == expected_set:
-            print(f"✓ PASS: {test_name}")
-            return True
-        else:
-            print(f"✗ FAIL: {test_name}")
+        # First check if files exist as expected
+        if actual_files != expected_set:
+            print(f"✗ FAIL: {test_name} - File structure mismatch")
             print(f"  Expected: {sorted(expected_set)}")
             print(f"  Actual:   {sorted(actual_files)}")
             return False
+            
+        # Then check file contents if expected_contents is provided
+        if expected_contents:
+            for filename, expected_content in expected_contents.items():
+                if filename in actual_files:
+                    try:
+                        with open(filename, 'r') as f:
+                            actual_content = f.read()
+                        if actual_content != expected_content:
+                            print(f"✗ FAIL: {test_name} - Content mismatch in {filename}")
+                            print(f"  Expected content: {repr(expected_content)}")
+                            print(f"  Actual content:   {repr(actual_content)}")
+                            return False
+                    except Exception as e:
+                        print(f"✗ FAIL: {test_name} - Could not read {filename}: {e}")
+                        return False
+                else:
+                    print(f"✗ FAIL: {test_name} - Expected file {filename} not found")
+                    return False
+        
+        print(f"✓ PASS: {test_name}")
+        return True
             
     finally:
         # Clean up
@@ -320,6 +340,71 @@ content = "\\n".join(lines) + "\\n"
         ["standalone.txt", "project", "temp"],
         vidir_command,
         python_command
+    ):
+        tests_passed += 1
+
+    # Test 11: Three-way cycle test (a->b->c->a) to test cycle detection and unstash
+    tests_total += 1
+    if run_vidir_test(
+        "Three-way Cycle",
+        {
+            "a.txt": "Content of A",
+            "b.txt": "Content of B", 
+            "c.txt": "Content of C"
+        },
+        '''
+# Create a cycle: a.txt -> b.txt, b.txt -> c.txt, c.txt -> a.txt
+content = content.replace("1\\t./a.txt", "1\\t./b.txt")
+content = content.replace("2\\t./b.txt", "2\\t./c.txt")
+content = content.replace("3\\t./c.txt", "3\\t./a.txt")
+        ''',
+        ["a.txt", "b.txt", "c.txt"],  # All three files should exist with rotated content
+        vidir_command=vidir_command,
+        python_command=python_command,
+        expected_contents={
+            "a.txt": "Content of C",  # a.txt gets content from c.txt
+            "b.txt": "Content of A",  # b.txt gets content from a.txt  
+            "c.txt": "Content of B"   # c.txt gets content from b.txt
+        }
+    ):
+        tests_passed += 1
+
+    # Test 12: Multiple cycles test (tests multiple stash operations)
+    tests_total += 1
+    if run_vidir_test(
+        "Multiple Cycles",
+        {
+            "cycle1_a.txt": "Content A1",
+            "cycle1_b.txt": "Content B1",
+            "cycle1_c.txt": "Content C1",
+            "cycle2_x.txt": "Content X2", 
+            "cycle2_y.txt": "Content Y2",
+            "cycle2_z.txt": "Content Z2"
+        },
+        '''
+# Create two separate cycles:
+# Cycle 1: cycle1_a -> cycle1_b -> cycle1_c -> cycle1_a
+# Cycle 2: cycle2_x -> cycle2_y -> cycle2_z -> cycle2_x
+content = content.replace("1\\t./cycle1_a.txt", "1\\t./cycle1_b.txt")
+content = content.replace("2\\t./cycle1_b.txt", "2\\t./cycle1_c.txt")
+content = content.replace("3\\t./cycle1_c.txt", "3\\t./cycle1_a.txt")
+content = content.replace("4\\t./cycle2_x.txt", "4\\t./cycle2_y.txt")
+content = content.replace("5\\t./cycle2_y.txt", "5\\t./cycle2_z.txt")
+content = content.replace("6\\t./cycle2_z.txt", "6\\t./cycle2_x.txt")
+        ''',
+        ["cycle1_a.txt", "cycle1_b.txt", "cycle1_c.txt", "cycle2_x.txt", "cycle2_y.txt", "cycle2_z.txt"],
+        vidir_command=vidir_command,
+        python_command=python_command,
+        expected_contents={
+            # Cycle 1: a->b->c->a (a gets c's content, b gets a's content, c gets b's content)
+            "cycle1_a.txt": "Content C1",
+            "cycle1_b.txt": "Content A1", 
+            "cycle1_c.txt": "Content B1",
+            # Cycle 2: x->y->z->x (x gets z's content, y gets x's content, z gets y's content)
+            "cycle2_x.txt": "Content Z2",
+            "cycle2_y.txt": "Content X2",
+            "cycle2_z.txt": "Content Y2"
+        }
     ):
         tests_passed += 1
     
