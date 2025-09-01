@@ -92,6 +92,9 @@ typedef struct {
     iz      len;
 } Plan;
 
+// Sentinels used in the next[] mapping for compute_plan
+enum { NEXT_DELETE = -2, NEXT_OUTSIDE = -1 };
+
 static u32 s8hash(s8 s)
 {
     u32 h = 0x811c9dc5;  // FNV-1a 32-bit offset basis
@@ -408,6 +411,24 @@ static void printi64(u8buf *b, i64 x)
     prints8(b, numstr);
 }
 
+// Add a leading "./" to a relative path for display and stable matching
+static s8 prepend_dot_slash(arena *perm, s8 path)
+{
+    if (path.len >= 2 && path.s[0] == '.' && (path.s[1] == '/' || path.s[1] == '\\')) {
+        return path; // already has ./ or .\\ form
+    }
+    // Absolute paths (starts with '/' or a Windows drive like 'C:') stay unchanged
+    if ((path.len >= 1 && (path.s[0] == '/' || path.s[0] == '\\')) ||
+        (path.len >= 2 && ((path.s[1] == ':' && ((path.s[0] >= 'A' && path.s[0] <= 'Z') || (path.s[0] >= 'a' && path.s[0] <= 'z')))))) {
+        return path;
+    }
+    u8 *p = new(perm, u8, path.len + 2);
+    p[0] = '.';
+    p[1] = '/';
+    for (iz i = 0; i < path.len; i++) p[2 + i] = path.s[i];
+    return (s8){p, path.len + 2};
+}
+
 // Input buffer for reading from stdin
 typedef struct {
     arena *perm;
@@ -548,373 +569,288 @@ static s8 *parse_temp_file(arena *perm, u8input *input, iz original_name_count)
         }
         path_copy[line_copy.len] = 0;  // null terminate
         
-        // Store in the array (convert to 0-based index)
-        names[parsed_line_num - 1] = (s8){path_copy, line_copy.len};
+        // Store in the array (convert to 0-based index), normalizing the path
+        s8 parsed_path = {path_copy, line_copy.len};
+        names[parsed_line_num - 1] = prepend_dot_slash(perm, parsed_path);
     }
     
     return names;
 }
 
 // Produce a sequence of operations necessary to achieve the new name set.
+// Helper: append an action to a plan (arena grows, simple copy-on-append)
+static void plan_append(arena *perm, Plan *p, Op op, s8 src, s8 dst)
+{
+    Action *arr = new(perm, Action, p->len + 1);
+    for (iz i = 0; i < p->len; i++) arr[i] = p->actions[i];
+    arr[p->len] = (Action){op, src, dst};
+    p->actions = arr;
+    p->len++;
+}
+
 static Plan compute_plan(arena *perm, s8 *oldnames, s8 *newnames, iz num_names)
 {
-    Plan plan = {0};
-    
-    // Create filesystem state tracker
-    fsstate *fs = new_fsstate(perm);
-    
-    // Initialize with all original files
+    Plan plan = (Plan){0};
+
+    if (num_names <= 0) return plan;
+
+    // Build reverse map old path -> index (1-based stored)
+    pathmap *rev = 0;
     for (iz i = 0; i < num_names; i++) {
-        fsstate_mark_exists(fs, oldnames[i]);
+        if (oldnames[i].s) {
+            i32 *slot = pathmap_insert(&rev, oldnames[i], perm);
+            *slot = (i32)(i + 1);
+        }
     }
 
-    // Create reverse map: newname -> old index (for detecting cycles)
-    pathmap *newname_map = 0;
+    // Arrays to track state
+    i32 *next = new(perm, i32, num_names);      // index of destination old item, or NEXT_OUTSIDE/NEXT_DELETE
+    b32 *needs = new(perm, b32, num_names);     // 1 if this index has a change (rename or delete)
+    b32 *done  = new(perm, b32, num_names);     // processed
+    for (iz i = 0; i < num_names; i++) { next[i] = NEXT_DELETE; needs[i] = 0; done[i] = 0; }
+
+    // Initialize mapping and mark trivial cases
     for (iz i = 0; i < num_names; i++) {
-        if (newnames[i].s && newnames[i].len > 0) {
-            i32 *old_idx = pathmap_insert(&newname_map, newnames[i], perm);
-            *old_idx = (i32)(i + 1);  // Store 1-based index (0 means not found)
+        s8 o = oldnames[i];
+        s8 n = newnames[i];
+        if (!n.s || n.len == 0) {
+            // Delete later
+            needs[i] = 1;
+            next[i] = NEXT_DELETE;  // delete sentinel
+            continue;
+        }
+        if (s8equals(o, n)) {
+            done[i] = 1;   // no-op
+            continue;
+        }
+        needs[i] = 1;
+        i32 *pv = pathmap_lookup(&rev, n);
+        if (pv && *pv) {
+            next[i] = *pv - 1;   // points to an existing old name
+        } else {
+            next[i] = NEXT_OUTSIDE;        // rename to a new (outside) path
         }
     }
-    
-    // Resolve conflicts deterministically by generating unique names upfront
-    s8 *resolved_names = new(perm, s8, num_names);
-    for (iz i = 0; i < num_names; i++) {
-        if (!newnames[i].s || newnames[i].len == 0) {
-            resolved_names[i] = (s8){0}; // Mark for deletion
-        } else if (s8equals(oldnames[i], newnames[i])) {
-            // No change - use original name as-is
-            resolved_names[i] = newnames[i];
-        } else {
-            // This is a rename - check if destination conflicts with existing files
-            // But not with other files in our rename set (those are cycles, not conflicts)
-            
-            // Check if destination exists in filesystem AND is not one of our source files
-            b32 is_filesystem_conflict = fsstate_exists(fs, newnames[i]);
-            b32 is_our_source_file = 0;
-            for (iz j = 0; j < num_names; j++) {
-                if (s8equals(newnames[i], oldnames[j])) {
-                    is_our_source_file = 1;
+
+    // 1) First, perform direct renames to outside targets (next == -1)
+    b32 progress = 1;
+    while (progress) {
+        progress = 0;
+        for (iz i = 0; i < num_names; i++) {
+            if (!done[i] && needs[i] && next[i] == NEXT_OUTSIDE) {
+                plan_append(perm, &plan, OP_RENAME, oldnames[i], newnames[i]);
+                done[i] = 1;
+                progress = 1;
+            }
+        }
+    }
+
+    // 2) Resolve remaining by walking chains; stash one per cycle
+    b32 any_left = 1;
+    while (any_left) {
+        any_left = 0;
+        for (iz start = 0; start < num_names; start++) {
+            if (done[start] || !needs[start]) continue;
+            if (next[start] == NEXT_DELETE) continue; // skip deletions in this phase
+            any_left = 1;
+
+            // Walk until we hit a processed node or detect a cycle
+            // Use per-walk marks: -1 = unseen, >=0 = position in path, -2 reserved
+            i32 *pos = new(perm, i32, num_names);
+            for (iz i = 0; i < num_names; i++) pos[i] = -1;
+
+            // path holds indices visited in order
+            iz path_len = 0;
+            i32 *path = new(perm, i32, num_names);
+
+            i32 v = (i32)start;
+            for (;;) {
+                if (done[v] || next[v] == NEXT_DELETE) {
+                    // Hit a processed node or deletion sentinel; treat as free end
                     break;
                 }
-            }
-            
-            if (is_filesystem_conflict && !is_our_source_file) {
-                // Real conflict with existing filesystem entry - generate unique name
-                resolved_names[i] = fsstate_unique_name(fs, newnames[i]);
-                fsstate_mark_exists(fs, resolved_names[i]);
-            } else {
-                // No real conflict (either destination is free, or it's a cycle) - use original destination
-                resolved_names[i] = newnames[i];
-                fsstate_mark_exists(fs, resolved_names[i]);
-            }
-        }
-    }
-    
-    // Count operations needed
-    iz action_count = 0;
-    for (iz i = 0; i < num_names; i++) {
-        if (!resolved_names[i].s || resolved_names[i].len == 0) {
-            // This item should be deleted
-            action_count++;
-        } else if (!s8equals(oldnames[i], resolved_names[i])) {
-            // This item is being renamed
-            i32 *conflict_idx = pathmap_lookup(&newname_map, oldnames[i]);
-            if (conflict_idx && *conflict_idx > 0 && (*conflict_idx - 1) != i) {
-                // There's a cycle - we need stash/unstash
-                action_count += 3;  // STASH, RENAME, UNSTASH
-            } else {
-                action_count++;  // Simple RENAME
-            }
-        }
-    }
-    
-    plan.actions = new(perm, Action, action_count);
-    plan.len = 0;
-    
-    // Track which items have been processed to handle cycles
-    b32 *processed = new(perm, b32, num_names);
-    for (iz i = 0; i < num_names; i++) {
-        processed[i] = 0;
-    }
-    
-    // First pass: handle simple renames and start cycles
-    for (iz i = 0; i < num_names; i++) {
-        if (processed[i]) continue;
-        
-        if (!resolved_names[i].s || resolved_names[i].len == 0) {
-            // Delete item
-            plan.actions[plan.len++] = (Action){OP_DELETE, oldnames[i], {0}};
-            processed[i] = 1;
-        } else if (!s8equals(oldnames[i], resolved_names[i])) {
-            // Rename item (resolved_names[i] is valid and different from oldnames[i])
-            // Check if this creates a cycle by following the chain
-            i32 *conflict_idx = pathmap_lookup(&newname_map, oldnames[i]);
-            if (conflict_idx && *conflict_idx > 0 && (*conflict_idx - 1) != i) {
-                // Potential cycle detected - follow the chain to find all participants
-                iz cycle_start = i;
-                iz cycle_length = 0;
-                iz *cycle_nodes = new(perm, iz, num_names);  // Allocate enough for worst case
-                iz current = i;
-                
-                // Follow the cycle chain in the forward direction (where each file wants to go)
-                do {
-                    if (cycle_length >= num_names) {
-                        // Cycle too long (shouldn't happen with valid input) - fall back to 2-element handling
-                        cycle_length = 0;
-                        break;
+                if (pos[v] >= 0) {
+                    // Cycle detected at pos[v]
+                    iz cstart = (iz)pos[v];
+                    // We will stash the first node in the cycle segment
+                    i32 i0 = path[cstart];
+                    plan_append(perm, &plan, OP_STASH, oldnames[i0], (s8){0});
+
+                    // Rename along the cycle from the tail back to the node after i0
+                    for (iz t = path_len - 1; t > cstart; t--) {
+                        i32 it = path[t];
+                        plan_append(perm, &plan, OP_RENAME, oldnames[it], newnames[it]);
+                        done[it] = 1;
                     }
-                    cycle_nodes[cycle_length++] = current;
-                    
-                    // Find where current file wants to go (forward direction)
-                    s8 current_destination = newnames[current];
-                    if (!current_destination.s || current_destination.len == 0) {
-                        // This file is being deleted, not part of rename cycle
-                        cycle_length = 0;
-                        break;
+                    // Finally, unstash into newnames[i0]
+                    plan_append(perm, &plan, OP_UNSTASH, (s8){0}, newnames[i0]);
+                    done[i0] = 1;
+
+                    // Mark the rest of cycle as done (they were renamed in loop)
+                    for (iz t = cstart + 1; t < path_len; t++) {
+                        done[path[t]] = 1;
                     }
-                    
-                    // Find which file currently occupies that destination
-                    iz next_file = -1;
-                    for (iz j = 0; j < num_names; j++) {
-                        if (s8equals(oldnames[j], current_destination)) {
-                            next_file = j;
-                            break;
+                    break;
+                }
+
+                pos[v] = (i32)path_len;
+                path[path_len++] = v;
+
+                if (next[v] == NEXT_OUTSIDE) {
+                    // The chain ends at an outside target (should have been handled earlier),
+                    // but if it's still here, process the tail-to-head renames now.
+                    for (iz t = path_len; t-- > 0;) {
+                        i32 it = path[t];
+                        if (!done[it]) {
+                            plan_append(perm, &plan, OP_RENAME, oldnames[it], newnames[it]);
+                            done[it] = 1;
                         }
                     }
-                    
-                    if (next_file == -1) {
-                        // Destination is not one of our files - not a cycle
-                        cycle_length = 0;
-                        break;
-                    }
-                    
-                    current = next_file;
-                } while (current != cycle_start && cycle_length < num_names);
-                
-                if (cycle_length > 1 && current == cycle_start) {
-                    // Complete cycle found! Handle it properly
-                    // For cycle A→B→C→A, we need: stash A, move C→A, move B→C, unstash A→B
-                    
-                    // Stash the first file to break the cycle
-                    iz stash_file = cycle_nodes[0];
-                    plan.actions[plan.len++] = (Action){OP_STASH, oldnames[stash_file], {0}};
-                    processed[stash_file] = 1;
-                    
-                    // Perform renames in reverse order (last file in cycle moves first)
-                    for (iz j = cycle_length - 1; j >= 1; j--) {
-                        iz from_file = cycle_nodes[j];
-                        iz to_file = cycle_nodes[j - 1];  
-                        plan.actions[plan.len++] = (Action){OP_RENAME, oldnames[from_file], oldnames[to_file]};
-                        processed[from_file] = 1;
-                    }
-                    
-                    // Unstash the first file to complete the cycle (to where the last file was)
-                    iz final_dest_file = cycle_nodes[cycle_length - 1];
-                    plan.actions[plan.len++] = (Action){OP_UNSTASH, {0}, oldnames[final_dest_file]};
-                    
-                } else {
-                    // No complete cycle detected - handle as simple rename
-                    plan.actions[plan.len++] = (Action){OP_RENAME, oldnames[i], resolved_names[i]};
-                    processed[i] = 1;
+                    break;
                 }
-            } else {
-                // Simple rename
-                plan.actions[plan.len++] = (Action){OP_RENAME, oldnames[i], resolved_names[i]};
-                processed[i] = 1;
+
+                if (done[next[v]] || next[next[v]] == NEXT_DELETE) {
+                    // Next points to a processed node or deletion sentinel -> we have a free slot.
+                    // Perform renames from tail to head into the freed spot.
+                    for (iz t = path_len; t-- > 0;) {
+                        i32 it = path[t];
+                        if (!done[it]) {
+                            plan_append(perm, &plan, OP_RENAME, oldnames[it], newnames[it]);
+                            done[it] = 1;
+                        }
+                    }
+                    break;
+                }
+
+                v = next[v];
             }
-        } else {
-            // No change needed
-            processed[i] = 1;
         }
     }
-    
+
+    // 3) Deletions at the end
+    for (iz i = 0; i < num_names; i++) {
+        if (needs[i] && next[i] == NEXT_DELETE) {
+            plan_append(perm, &plan, OP_DELETE, oldnames[i], (s8){0});
+            done[i] = 1;
+        }
+    }
+
     return plan;
 }
 
 // Execute the plan 
+// Helpers for stash stack
+static void stash_push(arena *scratch, s8 **stack, iz *len, s8 path)
+{
+    s8 *arr = new(scratch, s8, *len + 1);
+    for (iz i = 0; i < *len; i++) arr[i] = (*stack)[i];
+    arr[*len] = path;
+    *stack = arr;
+    (*len)++;
+}
+
+static s8 stash_pop(s8 **stack, iz *len)
+{
+    assert(*len > 0);
+    s8 r = (*stack)[*len - 1];
+    (*len)--;
+    return r;
+}
+
 static b32 execute_plan(Plan plan, arena scratch, os *ctx, u8buf *out, u8buf *err, b32 verbose)
 {
-    b32 has_errors = 0;
-    s8 stash_name = {0};  // Track stashed file name
-#if 0
-    // Debug: print all actions
-    for (iz i = 0; i < plan.len; i++) {
-        Action *action = &plan.actions[i];
-        prints8(err, S("DEBUG ACTION["));
-        printi64(err, i);
-        prints8(err, S("]: op="));
-        printi64(err, action->op);
-        prints8(err, S(" src='"));
-        prints8(err, action->src);
-        prints8(err, S("' dst_ptr=0x"));
-        printi64(err, (i64)action->dst.s);
-        prints8(err, S(" dst_len="));
-        printi64(err, action->dst.len);
-        prints8(err, S(" dst='"));
-        if (action->dst.s && action->dst.len > 0) {
-            prints8(err, action->dst);
-        } else {
-            prints8(err, S("(null/empty)"));
-        }
-        prints8(err, S("'\n"));
-    }
-    flush(err);
-#endif
+    // Track filesystem state and stash stack
+    fsstate *fs = new_fsstate(&scratch);
 
+    // Simple LIFO stash of temporary names
+    s8 *stash_stack = 0;
+    iz stash_len = 0;
+
+    // Execute each action
     for (iz i = 0; i < plan.len; i++) {
-        Action *action = &plan.actions[i];
-        
-        switch (action->op) {
-        case OP_DELETE:
-            if (!os_delete_path(ctx, scratch, action->src)) {
-                prints8(err, S("vidir: failed to remove "));
-                prints8(err, action->src);
+        Action a = plan.actions[i];
+        switch (a.op) {
+        case OP_STASH: {
+            // Choose a unique stash name near src
+            s8 stash_name = fsstate_unique_name(fs, a.src);
+            // Perform rename
+            if (!os_rename_file(ctx, scratch, a.src, stash_name)) {
+                prints8(err, S("vidir: failed to stash: "));
+                prints8(err, a.src);
                 prints8(err, S("\n"));
-                has_errors = 1;
-            } else if (verbose) {
-                prints8(out, S("removed '"));
-                prints8(out, action->src);
-                prints8(out, S("'\n"));
+                flush(err);
+                return 0;
             }
-            break;
-            
-        case OP_RENAME:
-            // Debug: check if dst is empty
-            if (!action->dst.s || action->dst.len == 0) {
-                prints8(err, S("vidir: DEBUG - empty destination path for src: "));
-                prints8(err, action->src);
+            fsstate_mark_deleted(fs, a.src);
+            fsstate_mark_exists(fs, stash_name);
+            stash_push(&scratch, &stash_stack, &stash_len, stash_name);
+        } break;
+        case OP_RENAME: {
+            // Ensure destination directory exists
+            s8 dir = dirname_s8(a.dst);
+            if (!os_create_dir(ctx, scratch, dir)) {
+                prints8(err, S("vidir: failed to create directory for: "));
+                prints8(err, a.dst);
                 prints8(err, S("\n"));
-                has_errors = 1;
-                break;
+                flush(err);
+                return 0;
             }
-            
-            // Create destination directory if needed
-            {
-                s8 dst_dir = dirname_s8(action->dst);
-                if (!s8equals(dst_dir, S(".")) && !os_path_is_dir(scratch, dst_dir)) {
-                    if (!os_create_dir(ctx, scratch, dst_dir)) {
-                        prints8(err, S("vidir: failed to create directory tree '"));
-                        prints8(err, dst_dir);
-                        prints8(err, S("' for destination '"));
-                        prints8(err, action->dst);
-                        prints8(err, S("'\n"));
-                        has_errors = 1;
-                        break;
-                    }
-                }
-            }
-            
-            // Perform the rename (conflicts already resolved during planning)
-            if (!os_rename_file(ctx, scratch, action->src, action->dst)) {
-                prints8(err, S("vidir: failed to rename "));
-                prints8(err, action->src);
-                prints8(err, S(" to "));
-                prints8(err, action->dst);
+
+            // Try rename directly
+            if (!os_rename_file(ctx, scratch, a.src, a.dst)) {
+                prints8(err, S("vidir: failed to rename: "));
+                prints8(err, a.src);
+                prints8(err, S(" -> "));
+                prints8(err, a.dst);
                 prints8(err, S("\n"));
-                has_errors = 1;
-            } else if (verbose) {
-                prints8(out, S("'"));
-                prints8(out, action->src);
-                prints8(out, S("' => '"));
-                prints8(out, action->dst);
-                prints8(out, S("'\n"));
+                flush(err);
+                return 0;
             }
-            break;
-            
-        case OP_STASH:
-            // Generate unique stash name
-            {
-                iz stash_len = action->src.len + 20;  // Room for .vidir_stash_123456
-                u8 *stash_buf = new(&scratch, u8, stash_len);
-                iz pos = 0;
-                for (iz j = 0; j < action->src.len; j++) {
-                    stash_buf[pos++] = action->src.s[j];
-                }
-                s8 suffix = S(".vidir_stash");
-                for (iz j = 0; j < suffix.len; j++) {
-                    stash_buf[pos++] = suffix.s[j];
-                }
-                
-                i32 counter = 0;
-                stash_name = (s8){stash_buf, pos};
-                
-                while (os_path_exists(scratch, stash_name)) {
-                    counter++;
-                    pos = action->src.len + suffix.len;
-                    i32 temp_counter = counter;
-                    u8 digits[16];
-                    iz digit_count = 0;
-                    
-                    do {
-                        digits[digit_count++] = '0' + (temp_counter % 10);
-                        temp_counter /= 10;
-                    } while (temp_counter > 0);
-                    
-                    for (iz j = 0; j < digit_count; j++) {
-                        stash_buf[pos + j] = digits[digit_count - 1 - j];
-                    }
-                    stash_name.len = pos + digit_count;
-                }
-            }
-            
-            if (!os_rename_file(ctx, scratch, action->src, stash_name)) {
-                prints8(err, S("vidir: failed to stash "));
-                prints8(err, action->src);
-                prints8(err, S(" to "));
-                prints8(err, stash_name);
+            fsstate_mark_deleted(fs, a.src);
+            fsstate_mark_exists(fs, a.dst);
+        } break;
+        case OP_UNSTASH: {
+            s8 stash_name = stash_pop(&stash_stack, &stash_len);
+
+            // Ensure destination directory exists
+            s8 dir = dirname_s8(a.dst);
+            if (!os_create_dir(ctx, scratch, dir)) {
+                prints8(err, S("vidir: failed to create directory for: "));
+                prints8(err, a.dst);
                 prints8(err, S("\n"));
-                has_errors = 1;
-            } else if (verbose) {
-                prints8(out, S("stashed '"));
-                prints8(out, action->src);
-                prints8(out, S("' -> '"));
-                prints8(out, stash_name);
-                prints8(out, S("'\n"));
+                flush(err);
+                return 0;
             }
-            break;
-            
-        case OP_UNSTASH:
-            if (!stash_name.s) {
-                prints8(err, S("vidir: internal error - no stash to unstash\n"));
-                has_errors = 1;
-                break;
-            }
-            
-            // Create destination directory if needed
-            {
-                s8 dst_dir = dirname_s8(action->dst);
-                if (!s8equals(dst_dir, S(".")) && !os_path_is_dir(scratch, dst_dir)) {
-                    if (!os_create_dir(ctx, scratch, dst_dir)) {
-                        prints8(err, S("vidir: failed to create directory tree "));
-                        prints8(err, dst_dir);
-                        prints8(err, S("\n"));
-                        has_errors = 1;
-                        break;
-                    }
-                }
-            }
-            
-            if (!os_rename_file(ctx, scratch, stash_name, action->dst)) {
-                prints8(err, S("vidir: failed to unstash "));
-                prints8(err, stash_name);
-                prints8(err, S(" to "));
-                prints8(err, action->dst);
+
+            if (!os_rename_file(ctx, scratch, stash_name, a.dst)) {
+                prints8(err, S("vidir: failed to unstash into: "));
+                prints8(err, a.dst);
                 prints8(err, S("\n"));
-                has_errors = 1;
-            } else if (verbose) {
-                prints8(out, S("unstashed '"));
-                prints8(out, stash_name);
-                prints8(out, S("' => '"));
-                prints8(out, action->dst);
-                prints8(out, S("'\n"));
+                flush(err);
+                return 0;
             }
-            stash_name = (s8){0};  // Clear stash name
-            break;
+            fsstate_mark_deleted(fs, stash_name);
+            fsstate_mark_exists(fs, a.dst);
+        } break;
+        case OP_DELETE: {
+            if (!os_delete_path(ctx, scratch, a.src)) {
+                // If already gone, ignore; else report
+                if (fsstate_exists(fs, a.src)) {
+                    prints8(err, S("vidir: failed to delete: "));
+                    prints8(err, a.src);
+                    prints8(err, S("\n"));
+                    flush(err);
+                    return 0;
+                }
+            } else {
+                fsstate_mark_deleted(fs, a.src);
+            }
+        } break;
         }
     }
-    
-    return !has_errors;
+
+    (void)out; (void)verbose; // Currently unused
+    return 1;
 }
 
 // Parse a line from temp file: "number\tpath"
@@ -1111,12 +1047,13 @@ static void vidir(config *conf)
             continue;
         }
         
-        original_names[original_name_count] = path;
+        s8 display = prepend_dot_slash(perm, path);
+        original_names[original_name_count] = display;
         original_name_count++;
         
         printi64(tmp, original_name_count);
         prints8(tmp, S("\t"));
-        prints8(tmp, path);
+        prints8(tmp, display);
         prints8(tmp, S("\n"));
     }
     
