@@ -90,6 +90,7 @@ typedef struct {
 typedef struct {
     Action *actions;
     iz      len;
+    iz      cap;
 } Plan;
 
 // Sentinels used in the next[] mapping for compute_plan
@@ -541,6 +542,9 @@ static s8 nextline(u8input *b)
 static s8 *parse_temp_file(arena *perm, u8input *input, iz original_name_count)
 {
     s8 *names = new(perm, s8, original_name_count);
+    // Track duplicate item numbers
+    u8 *seen = new(perm, u8, original_name_count);
+    for (iz i = 0; i < original_name_count; i++) seen[i] = 0;
     
     for (;;) {
         s8 line = nextline(input);
@@ -570,8 +574,13 @@ static s8 *parse_temp_file(arena *perm, u8input *input, iz original_name_count)
         path_copy[line_copy.len] = 0;  // null terminate
         
         // Store in the array (convert to 0-based index), normalizing the path
+        iz idx = (iz)(parsed_line_num - 1);
+        if (seen[idx]) {
+            assert(0 && "vidir: duplicate item number in temp file");
+        }
+        seen[idx] = 1;
         s8 parsed_path = {path_copy, line_copy.len};
-        names[parsed_line_num - 1] = prepend_dot_slash(perm, parsed_path);
+        names[idx] = prepend_dot_slash(perm, parsed_path);
     }
     
     return names;
@@ -581,11 +590,15 @@ static s8 *parse_temp_file(arena *perm, u8input *input, iz original_name_count)
 // Helper: append an action to a plan (arena grows, simple copy-on-append)
 static void plan_append(arena *perm, Plan *p, Op op, s8 src, s8 dst)
 {
-    Action *arr = new(perm, Action, p->len + 1);
-    for (iz i = 0; i < p->len; i++) arr[i] = p->actions[i];
-    arr[p->len] = (Action){op, src, dst};
-    p->actions = arr;
-    p->len++;
+    // Amortized growth
+    if (p->len >= p->cap) {
+        iz new_cap = p->cap ? p->cap * 2 : 8;
+        Action *arr = new(perm, Action, new_cap);
+        for (iz i = 0; i < p->len; i++) arr[i] = p->actions[i];
+        p->actions = arr;
+        p->cap = new_cap;
+    }
+    p->actions[p->len++] = (Action){op, src, dst};
 }
 
 static Plan compute_plan(arena *perm, s8 *oldnames, s8 *newnames, iz num_names)
@@ -593,6 +606,21 @@ static Plan compute_plan(arena *perm, s8 *oldnames, s8 *newnames, iz num_names)
     Plan plan = (Plan){0};
 
     if (num_names <= 0) return plan;
+
+    // Detect duplicate target filenames (excluding deletions)
+    {
+        pathmap *targets = 0;
+        for (iz i = 0; i < num_names; i++) {
+            s8 n = newnames[i];
+            if (n.s && n.len) {
+                i32 *seen = pathmap_insert(&targets, n, perm);
+                if (*seen) {
+                    assert(0 && "vidir: duplicate target filename detected");
+                }
+                *seen = 1;
+            }
+        }
+    }
 
     // Build reverse map old path -> index (1-based stored)
     pathmap *rev = 0;
@@ -603,11 +631,10 @@ static Plan compute_plan(arena *perm, s8 *oldnames, s8 *newnames, iz num_names)
         }
     }
 
-    // Arrays to track state
-    i32 *next = new(perm, i32, num_names);      // index of destination old item, or NEXT_OUTSIDE/NEXT_DELETE
-    b32 *needs = new(perm, b32, num_names);     // 1 if this index has a change (rename or delete)
-    b32 *done  = new(perm, b32, num_names);     // processed
-    for (iz i = 0; i < num_names; i++) { next[i] = NEXT_DELETE; needs[i] = 0; done[i] = 0; }
+    // Combined per-item state
+    typedef struct { i32 to; b32 needs; b32 done; } Node;
+    Node *nodes = new(perm, Node, num_names);
+    for (iz i = 0; i < num_names; i++) { nodes[i].to = NEXT_DELETE; nodes[i].needs = 0; nodes[i].done = 0; }
 
     // Initialize mapping and mark trivial cases
     for (iz i = 0; i < num_names; i++) {
@@ -615,20 +642,20 @@ static Plan compute_plan(arena *perm, s8 *oldnames, s8 *newnames, iz num_names)
         s8 n = newnames[i];
         if (!n.s || n.len == 0) {
             // Delete later
-            needs[i] = 1;
-            next[i] = NEXT_DELETE;  // delete sentinel
+            nodes[i].needs = 1;
+            nodes[i].to = NEXT_DELETE;  // delete sentinel
             continue;
         }
         if (s8equals(o, n)) {
-            done[i] = 1;   // no-op
+            nodes[i].done = 1;   // no-op
             continue;
         }
-        needs[i] = 1;
+        nodes[i].needs = 1;
         i32 *pv = pathmap_lookup(&rev, n);
         if (pv && *pv) {
-            next[i] = *pv - 1;   // points to an existing old name
+            nodes[i].to = *pv - 1;   // points to an existing old name
         } else {
-            next[i] = NEXT_OUTSIDE;        // rename to a new (outside) path
+            nodes[i].to = NEXT_OUTSIDE;        // rename to a new (outside) path
         }
     }
 
@@ -637,9 +664,9 @@ static Plan compute_plan(arena *perm, s8 *oldnames, s8 *newnames, iz num_names)
     while (progress) {
         progress = 0;
         for (iz i = 0; i < num_names; i++) {
-            if (!done[i] && needs[i] && next[i] == NEXT_OUTSIDE) {
+            if (!nodes[i].done && nodes[i].needs && nodes[i].to == NEXT_OUTSIDE) {
                 plan_append(perm, &plan, OP_RENAME, oldnames[i], newnames[i]);
-                done[i] = 1;
+                nodes[i].done = 1;
                 progress = 1;
             }
         }
@@ -650,22 +677,23 @@ static Plan compute_plan(arena *perm, s8 *oldnames, s8 *newnames, iz num_names)
     while (any_left) {
         any_left = 0;
         for (iz start = 0; start < num_names; start++) {
-            if (done[start] || !needs[start]) continue;
-            if (next[start] == NEXT_DELETE) continue; // skip deletions in this phase
+            if (nodes[start].done || !nodes[start].needs) continue;
+            if (nodes[start].to == NEXT_DELETE) continue; // skip deletions in this phase
             any_left = 1;
 
             // Walk until we hit a processed node or detect a cycle
-            // Use per-walk marks: -1 = unseen, >=0 = position in path, -2 reserved
-            i32 *pos = new(perm, i32, num_names);
+            // Use per-walk marks: -1 = unseen, >=0 = position in path
+            arena scratch = *perm;
+            i32 *pos = new(&scratch, i32, num_names);
             for (iz i = 0; i < num_names; i++) pos[i] = -1;
 
             // path holds indices visited in order
             iz path_len = 0;
-            i32 *path = new(perm, i32, num_names);
+            i32 *path = new(&scratch, i32, num_names);
 
             i32 v = (i32)start;
             for (;;) {
-                if (done[v] || next[v] == NEXT_DELETE) {
+                if (nodes[v].done || nodes[v].to == NEXT_DELETE) {
                     // Hit a processed node or deletion sentinel; treat as free end
                     break;
                 }
@@ -680,15 +708,15 @@ static Plan compute_plan(arena *perm, s8 *oldnames, s8 *newnames, iz num_names)
                     for (iz t = path_len - 1; t > cstart; t--) {
                         i32 it = path[t];
                         plan_append(perm, &plan, OP_RENAME, oldnames[it], newnames[it]);
-                        done[it] = 1;
+                        nodes[it].done = 1;
                     }
                     // Finally, unstash into newnames[i0]
                     plan_append(perm, &plan, OP_UNSTASH, (s8){0}, newnames[i0]);
-                    done[i0] = 1;
+                    nodes[i0].done = 1;
 
                     // Mark the rest of cycle as done (they were renamed in loop)
                     for (iz t = cstart + 1; t < path_len; t++) {
-                        done[path[t]] = 1;
+                        nodes[path[t]].done = 1;
                     }
                     break;
                 }
@@ -696,42 +724,42 @@ static Plan compute_plan(arena *perm, s8 *oldnames, s8 *newnames, iz num_names)
                 pos[v] = (i32)path_len;
                 path[path_len++] = v;
 
-                if (next[v] == NEXT_OUTSIDE) {
+                if (nodes[v].to == NEXT_OUTSIDE) {
                     // The chain ends at an outside target (should have been handled earlier),
                     // but if it's still here, process the tail-to-head renames now.
                     for (iz t = path_len; t-- > 0;) {
                         i32 it = path[t];
-                        if (!done[it]) {
+                        if (!nodes[it].done) {
                             plan_append(perm, &plan, OP_RENAME, oldnames[it], newnames[it]);
-                            done[it] = 1;
+                            nodes[it].done = 1;
                         }
                     }
                     break;
                 }
 
-                if (done[next[v]] || next[next[v]] == NEXT_DELETE) {
+                if (nodes[nodes[v].to].done || nodes[nodes[v].to].to == NEXT_DELETE) {
                     // Next points to a processed node or deletion sentinel -> we have a free slot.
                     // Perform renames from tail to head into the freed spot.
                     for (iz t = path_len; t-- > 0;) {
                         i32 it = path[t];
-                        if (!done[it]) {
+                        if (!nodes[it].done) {
                             plan_append(perm, &plan, OP_RENAME, oldnames[it], newnames[it]);
-                            done[it] = 1;
+                            nodes[it].done = 1;
                         }
                     }
                     break;
                 }
 
-                v = next[v];
+                v = nodes[v].to;
             }
         }
     }
 
     // 3) Deletions at the end
     for (iz i = 0; i < num_names; i++) {
-        if (needs[i] && next[i] == NEXT_DELETE) {
+        if (nodes[i].needs && nodes[i].to == NEXT_DELETE) {
             plan_append(perm, &plan, OP_DELETE, oldnames[i], (s8){0});
-            done[i] = 1;
+            nodes[i].done = 1;
         }
     }
 
@@ -762,6 +790,14 @@ static b32 execute_plan(Plan plan, arena scratch, os *ctx, u8buf *out, u8buf *er
     // Track filesystem state and stash stack
     fsstate *fs = new_fsstate(&scratch);
 
+    // Reserve all destination paths first to avoid stash collisions with final targets
+    for (iz i = 0; i < plan.len; i++) {
+        Action a = plan.actions[i];
+        if ((a.op == OP_RENAME || a.op == OP_UNSTASH) && a.dst.s && a.dst.len) {
+            fsstate_mark_exists(fs, a.dst);
+        }
+    }
+
     // Simple LIFO stash of temporary names
     s8 *stash_stack = 0;
     iz stash_len = 0;
@@ -783,6 +819,13 @@ static b32 execute_plan(Plan plan, arena scratch, os *ctx, u8buf *out, u8buf *er
             }
             fsstate_mark_deleted(fs, a.src);
             fsstate_mark_exists(fs, stash_name);
+            if (verbose) {
+                prints8(out, S("stash "));
+                prints8(out, a.src);
+                prints8(out, S(" -> "));
+                prints8(out, stash_name);
+                prints8(out, S("\n"));
+            }
             stash_push(&scratch, &stash_stack, &stash_len, stash_name);
         } break;
         case OP_RENAME: {
@@ -808,6 +851,13 @@ static b32 execute_plan(Plan plan, arena scratch, os *ctx, u8buf *out, u8buf *er
             }
             fsstate_mark_deleted(fs, a.src);
             fsstate_mark_exists(fs, a.dst);
+            if (verbose) {
+                prints8(out, S("rename "));
+                prints8(out, a.src);
+                prints8(out, S(" -> "));
+                prints8(out, a.dst);
+                prints8(out, S("\n"));
+            }
         } break;
         case OP_UNSTASH: {
             s8 stash_name = stash_pop(&stash_stack, &stash_len);
@@ -831,6 +881,13 @@ static b32 execute_plan(Plan plan, arena scratch, os *ctx, u8buf *out, u8buf *er
             }
             fsstate_mark_deleted(fs, stash_name);
             fsstate_mark_exists(fs, a.dst);
+            if (verbose) {
+                prints8(out, S("unstash "));
+                prints8(out, stash_name);
+                prints8(out, S(" -> "));
+                prints8(out, a.dst);
+                prints8(out, S("\n"));
+            }
         } break;
         case OP_DELETE: {
             if (!os_delete_path(ctx, scratch, a.src)) {
@@ -844,6 +901,11 @@ static b32 execute_plan(Plan plan, arena scratch, os *ctx, u8buf *out, u8buf *er
                 }
             } else {
                 fsstate_mark_deleted(fs, a.src);
+            }
+            if (verbose) {
+                prints8(out, S("delete "));
+                prints8(out, a.src);
+                prints8(out, S("\n"));
             }
         } break;
         }
