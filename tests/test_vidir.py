@@ -408,6 +408,35 @@ content = content.replace("6\\t./cycle2_z.txt", "6\\t./cycle2_x.txt")
     ):
         tests_passed += 1
     
+    # Test: Duplicate Targets (Perl-compatible: last one wins, earlier files moved aside)
+    tests_total += 1
+    if run_vidir_test(
+        "Duplicate Targets",
+        {
+            "file1.txt": "content1",
+            "file2.txt": "content2", 
+            "file3.txt": "content3"
+        },
+        '''
+# Rename all three files to the same target
+content = content.replace("1\\t./file1.txt", "1\\t./target.txt")
+content = content.replace("2\\t./file2.txt", "2\\t./target.txt")
+content = content.replace("3\\t./file3.txt", "3\\t./target.txt")
+        ''',
+        ["target.txt", "target.txt~", "target.txt~1"],  # Expected result files
+        ["file1.txt", "file2.txt", "file3.txt"],  # Pass explicit files to vidir
+        vidir_command,
+        python_command,
+        expected_contents={
+            # Last one wins - file3 becomes target.txt
+            "target.txt": "content3",
+            # Earlier files are moved aside with ~ suffixes
+            "target.txt~": "content1",
+            "target.txt~1": "content2"
+        }
+    ):
+        tests_passed += 1
+    
     print(f"\n=== Test Results ===")
     print(f"Passed: {tests_passed}/{tests_total}")
     
