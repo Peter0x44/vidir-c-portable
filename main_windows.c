@@ -712,6 +712,12 @@ static b32 os_rename_file(os *ctx, arena scratch, s8 src, s8 dst)
     return MoveFileW(wsrc.s, wdst.s) != 0;
 }
 
+// Exit the program with the given exit code
+static void os_exit(i32 code)
+{
+    ExitProcess(code);
+}
+
 
 #if 1
 __attribute((force_align_arg_pointer))

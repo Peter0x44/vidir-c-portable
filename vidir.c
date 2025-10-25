@@ -344,6 +344,7 @@ static void os_open_temp_file(os *ctx);
 static b32  os_rename_file(os *ctx, arena scratch, s8 src, s8 dst);
 static b32  os_delete_path(os *ctx, arena scratch, s8 path);
 static b32  os_create_dir(os *ctx, arena scratch, s8 path);
+static void os_exit(i32 code);
 
 typedef struct {
     arena *perm;
@@ -444,7 +445,7 @@ typedef struct {
 
 // Parse the temporary file into an array of names. Returns an array of exactly
 // original_name_count items. Missing items (to be deleted) are null.
-static s8 *parse_temp_file(arena *perm, u8input *input, iz original_name_count);
+static s8 *parse_temp_file(arena *perm, u8input *input, iz original_name_count, u8buf *err);
 
 // Produce a sequence of operations necessary to achieve the new name set.
 static Plan compute_plan(arena *perm, s8 *oldnames, s8 *newnames, iz num_names);
@@ -539,7 +540,7 @@ static s8 nextline(u8input *b)
 
 // Parse the temporary file into an array of names. Returns an array of exactly
 // original_name_count items. Missing items (to be deleted) are null.
-static s8 *parse_temp_file(arena *perm, u8input *input, iz original_name_count)
+static s8 *parse_temp_file(arena *perm, u8input *input, iz original_name_count, u8buf *err)
 {
     s8 *names = new(perm, s8, original_name_count);
     // Track duplicate item numbers
@@ -556,14 +557,16 @@ static s8 *parse_temp_file(arena *perm, u8input *input, iz original_name_count)
         i32 parsed_line_num;
         s8 line_copy = line;
         if (!parse_temp_line(&line_copy, &parsed_line_num)) {
-            // Unable to parse line - this is fatal in strict mode (like Perl vidir)
-            assert(0 && "vidir: unable to parse line, aborting");
+            prints8(err, S("vidir: unable to parse line, aborting\n"));
+            flush(err);
+            os_exit(1);
         }
         
         // Check if line number is in valid range [1, original_name_count]
         if (parsed_line_num < 1 || parsed_line_num > original_name_count) {
-            // Invalid line number - this is fatal in strict mode (like Perl vidir)
-            assert(0 && "vidir: unknown item number");
+            prints8(err, S("vidir: unknown item number\n"));
+            flush(err);
+            os_exit(1);
         }
         
         // Copy the path to permanent memory
@@ -576,7 +579,9 @@ static s8 *parse_temp_file(arena *perm, u8input *input, iz original_name_count)
         // Store in the array (convert to 0-based index), normalizing the path
         iz idx = (iz)(parsed_line_num - 1);
         if (seen[idx]) {
-            assert(0 && "vidir: duplicate item number in temp file");
+            prints8(err, S("vidir: duplicate item number in temp file\n"));
+            flush(err);
+            os_exit(1);
         }
         seen[idx] = 1;
         s8 parsed_path = {path_copy, line_copy.len};
@@ -603,14 +608,16 @@ static void plan_append(arena *perm, Plan *p, Op op, s8 src, s8 dst)
 
 static Plan compute_plan(arena *perm, s8 *oldnames, s8 *newnames, iz num_names)
 {
-    /* Algorithm: Generate a safe sequence of file operations to transform oldnames -> newnames.
+    /* Algorithm: Sequence of file operations to transform oldnames -> newnames.
      * 
      * The challenge is handling rename cycles (A->B, B->A) and conflicts where destinations are
      * occupied. We solve this by:
      * 
      * 1. Compute final destinations accounting for duplicate targets. When multiple files want
      *    the same destination, the last one wins and gets the actual path. Earlier duplicates
-     *    get ~ backups: first->file.txt~, second->file.txt~1, third0>file.txt~2, etc.
+     *    get ~ backups: first->file.txt~, second->file.txt~1, third->file.txt~2, etc.
+     *
+     * TODO: Add other options to resolve these conflicts.
      * 
      * 2. Identify "blockers" - files being deleted whose current paths are wanted as destinations
      *    by other files. These blockers must be deleted early (before renames) to free their paths.
@@ -628,7 +635,6 @@ static Plan compute_plan(arena *perm, s8 *oldnames, s8 *newnames, iz num_names)
      *      early deletes)
      *    - Unstash in LIFO order (reverse of stashing) to resolve cycles
      *    - Remaining deletes (files not needed as blockers)
-     * 
      */
     
     Plan plan = (Plan){0};
@@ -998,7 +1004,7 @@ static void vidir(config *conf)
                     prints8(err, arg);
                     prints8(err, S("\n"));
                     flush(err);
-                    assert(0 && "Unknown option: TODO exit");
+                    os_exit(1);
                 }
             } else {
                 // Add path as-is, we'll expand directories later
@@ -1139,7 +1145,7 @@ static void vidir(config *conf)
     os_open_temp_file(perm->ctx);
     
     // Parse the temp file into the new names array
-    s8 *new_names = parse_temp_file(perm, input, original_name_count);
+    s8 *new_names = parse_temp_file(perm, input, original_name_count, err);
     
     // Compute the plan
     Plan plan = compute_plan(perm, original_names, new_names, original_name_count);
