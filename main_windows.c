@@ -540,7 +540,11 @@ static b32 os_invoke_editor(os *ctx, arena scratch)
         assert(0 && "Implement proper error");  // No temp file to edit
     }
     
-    s16 editor = fromenv_w(&scratch, L"EDITOR");
+    // Check VISUAL first, then EDITOR, then fall back to default
+    s16 editor = fromenv_w(&scratch, L"VISUAL");
+    if (!editor.len) {
+        editor = fromenv_w(&scratch, L"EDITOR");
+    }
     if (!editor.len) {
         editor = (s16){ DEFAULT_EDITOR, countof(DEFAULT_EDITOR) - 1};
     }
