@@ -603,11 +603,39 @@ static void plan_append(arena *perm, Plan *p, Op op, s8 src, s8 dst)
 
 static Plan compute_plan(arena *perm, s8 *oldnames, s8 *newnames, iz num_names)
 {
+    /* Algorithm: Generate a safe sequence of file operations to transform oldnames -> newnames.
+     * 
+     * The challenge is handling rename cycles (A->B, B->A) and conflicts where destinations are
+     * occupied. We solve this by:
+     * 
+     * 1. Compute final destinations accounting for duplicate targets. When multiple files want
+     *    the same destination, the last one wins and gets the actual path. Earlier duplicates
+     *    get ~ backups: first->file.txt~, second->file.txt~1, third0>file.txt~2, etc.
+     * 
+     * 2. Identify "blockers" - files being deleted whose current paths are wanted as destinations
+     *    by other files. These blockers must be deleted early (before renames) to free their paths.
+     *    Example: deleting A, but B->A needs that path freed first.
+     * 
+     * 3. Handle rename cycles by temporarily stashing files. When A->B but B's path is occupied
+     *    by a file that's not being deleted early, we can't rename A directly. Instead, stash A
+     *    to a temporary name (A~), do other operations, then unstash to B. The LIFO unstash order
+     *    (reverse of stashing) ensures cyclic dependencies resolve correctly.
+     * 
+     * 4. Execute operations in a specific order:
+     *    - Stash files involved in cycles (to temporary names)
+     *    - Delete blockers early (to free their paths)
+     *    - Direct renames (duplicates, files moving to unoccupied paths, or paths freed by
+     *      early deletes)
+     *    - Unstash in LIFO order (reverse of stashing) to resolve cycles
+     *    - Remaining deletes (files not needed as blockers)
+     * 
+     */
+    
     Plan plan = (Plan){0};
 
     if (num_names <= 0) return plan;
 
-    // Build reverse map old path -> index (1-based stored)
+    // Build reverse map: old path -> array index
     pathmap *rev = 0;
     for (iz i = 0; i < num_names; i++) {
         if (oldnames[i].s) {
@@ -616,154 +644,124 @@ static Plan compute_plan(arena *perm, s8 *oldnames, s8 *newnames, iz num_names)
         }
     }
 
-    // Classify entries
-    u8 *is_delete = new(perm, u8, num_names);
-    u8 *is_move   = new(perm, u8, num_names);
-    i32 *owner    = new(perm, i32, num_names);  // index of owner of destination, or NEXT_OUTSIDE
+    // Compute owner for each destination (who currently owns that path, if anyone)
+    i32 *owner = new(perm, i32, num_names);  // index of owner of destination, or NEXT_OUTSIDE
     for (iz i = 0; i < num_names; i++) {
-        is_delete[i] = 0; is_move[i] = 0; owner[i] = NEXT_OUTSIDE;
+        owner[i] = NEXT_OUTSIDE;
         s8 o = oldnames[i];
         s8 n = newnames[i];
-        if (!n.s || n.len == 0) {
-            is_delete[i] = 1;
-            continue;
-        }
-        if (!s8equals(o, n)) {
-            is_move[i] = 1;
-            i32 *pv = pathmap_lookup(&rev, n);
-            if (pv && *pv) owner[i] = *pv - 1; else owner[i] = NEXT_OUTSIDE;
-        }
+        
+        // Skip deletes and non-moves
+        if (!n.s || n.len == 0) continue;
+        if (s8equals(o, n)) continue;
+        
+        // This is a move - find who owns the destination
+        i32 *pv = pathmap_lookup(&rev, n);
+        if (pv && *pv) owner[i] = *pv - 1;
     }
 
     // Identify blockers that will be deleted early (their path is a destination for someone)
     u8 *early_del = new(perm, u8, num_names);
     for (iz j = 0; j < num_names; j++) early_del[j] = 0;
     for (iz i = 0; i < num_names; i++) {
-        if (is_move[i] && owner[i] != NEXT_OUTSIDE && is_delete[owner[i]]) {
+        s8 n = newnames[i];
+        // Check if this is a move to an occupied location whose owner is being deleted
+        if (!s8equals(oldnames[i], n) && n.s && n.len != 0 &&
+            owner[i] != NEXT_OUTSIDE && (!newnames[owner[i]].s || newnames[owner[i]].len == 0)) {
             early_del[owner[i]] = 1;
         }
     }
 
-    // Detect duplicate targets: mark all but the last occurrence
-    // This implements Perl vidir's "last-one-wins" behavior
-    u8 *is_dup_target = new(perm, u8, num_names);
-    for (iz i = 0; i < num_names; i++) is_dup_target[i] = 0;
-    
-    // Compute final destinations for duplicate targets
-    // Earlier duplicates get ~ suffixes, last one gets the actual target
+    // Handle duplicate targets: compute final destinations with ~ suffixes
+    // Earlier duplicates get ~, ~1, ~2 etc; last one gets the actual target
     s8 *final_dest = new(perm, s8, num_names);
-    for (iz i = 0; i < num_names; i++) final_dest[i] = newnames[i];  // Default to original target
-    
     {
-        pathmap *target_last_idx = 0;  // Maps target -> last index that wants it
+        pathmap *target_last_idx = 0;  // Maps target -> last index wanting it
+        pathmap *dup_count_map = 0;    // Maps target -> count of duplicates seen
         
-        // First pass: find the LAST occurrence of each target
+        // Find last occurrence of each target
         for (iz i = 0; i < num_names; i++) {
+            final_dest[i] = newnames[i];  // Default: use original target
             s8 n = newnames[i];
-            if (n.s && n.len && is_move[i]) {
-                i32 *last_idx = pathmap_insert(&target_last_idx, n, perm);
-                *last_idx = (i32)(i + 1);  // Store 1-based, will be overwritten to track last
+            if (n.s && n.len && !s8equals(oldnames[i], n)) {
+                i32 *last = pathmap_insert(&target_last_idx, n, perm);
+                *last = (i32)(i + 1);
             }
         }
         
-        // Second pass: mark all occurrences that are NOT the last as duplicates
+        // Assign ~ suffixes to duplicates (all but last occurrence)
         for (iz i = 0; i < num_names; i++) {
-            s8 n = newnames[i];
-            if (n.s && n.len && is_move[i]) {
-                i32 *last_idx = pathmap_lookup(&target_last_idx, n);
-                if (last_idx && *last_idx != (i32)(i + 1)) {
-                    // This is not the last occurrence - mark as duplicate
-                    is_dup_target[i] = 1;
+            s8 target = newnames[i];
+            // Skip non-moves
+            if (s8equals(oldnames[i], target) || !target.s || !target.len) continue;
+            
+            i32 *last = pathmap_lookup(&target_last_idx, target);
+            if (!last || *last == (i32)(i + 1)) continue;  // Last occurrence or not found
+            
+            // This is an earlier duplicate - add ~ suffix
+            i32 *count = pathmap_insert(&dup_count_map, target, perm);
+            i32 suffix_num = (*count)++;
+            
+            // Build final path: target~ or target~N
+            iz suffix_len = 1;  // For '~'
+            if (suffix_num > 0) {
+                // Count digits in suffix_num
+                for (i32 n = suffix_num; n > 0; n /= 10) suffix_len++;
+            }
+            
+            u8 *path = new(perm, u8, target.len + suffix_len);
+            for (iz j = 0; j < target.len; j++) path[j] = target.s[j];
+            path[target.len] = '~';
+            
+            if (suffix_num > 0) {
+                // Write digits in reverse
+                iz pos = target.len + suffix_len - 1;
+                for (i32 n = suffix_num; n > 0; n /= 10) {
+                    path[pos--] = '0' + (n % 10);
                 }
             }
-        }
-        
-        // Third pass: assign final destinations with ~ suffixes for duplicates
-        pathmap *dup_count_map = 0;
-        for (iz i = 0; i < num_names; i++) {
-            if (is_dup_target[i]) {
-                s8 target = newnames[i];
-                i32 *dup_count = pathmap_insert(&dup_count_map, target, perm);
-                
-                // Generate suffix: first dup gets ~, second gets ~1, etc.
-                s8 final;
-                if (*dup_count == 0) {
-                    // First duplicate: add just ~
-                    iz new_len = target.len + 1;
-                    u8 *new_path = new(perm, u8, new_len);
-                    for (iz j = 0; j < target.len; j++) new_path[j] = target.s[j];
-                    new_path[target.len] = '~';
-                    final = (s8){new_path, new_len};
-                } else {
-                    // Subsequent duplicates: add ~N
-                    u8 digits[16];
-                    iz digit_count = 0;
-                    i32 num = *dup_count;
-                    do {
-                        digits[digit_count++] = '0' + (num % 10);
-                        num /= 10;
-                    } while (num > 0);
-                    
-                    iz new_len = target.len + 1 + digit_count;
-                    u8 *new_path = new(perm, u8, new_len);
-                    for (iz j = 0; j < target.len; j++) new_path[j] = target.s[j];
-                    new_path[target.len] = '~';
-                    for (iz j = 0; j < digit_count; j++) {
-                        new_path[target.len + 1 + j] = digits[digit_count - 1 - j];
-                    }
-                    final = (s8){new_path, new_len};
-                }
-                
-                final_dest[i] = final;
-                (*dup_count)++;
-            }
+            
+            final_dest[i] = (s8){path, target.len + suffix_len};
         }
     }
 
-    // Phase A: stash movers that target occupied paths whose owners are not being deleted
-    //          (but NOT duplicate targets - those will be handled via collision in executor)
+    // Stash files in cycles, delete blockers, do direct renames, unstash, then remaining deletes
     i32 *stashed = new(perm, i32, num_names);
     iz stashed_len = 0;
     for (iz i = 0; i < num_names; i++) {
-        if (!is_move[i]) continue;
-        if (is_dup_target[i]) continue;  // Skip duplicates - they'll do direct renames with collision handling
+        s8 n = newnames[i];
+        if (s8equals(oldnames[i], n) || !n.s || !n.len) continue;
+        if (!s8equals(final_dest[i], n)) continue;  // Skip duplicates (don't create cycles)
         if (owner[i] != NEXT_OUTSIDE && !early_del[owner[i]]) {
             plan_append(perm, &plan, OP_STASH, oldnames[i], (s8){0});
             stashed[stashed_len++] = (i32)i;
         }
     }
 
-    // Phase B1: early delete blockers to free destinations
     for (iz j = 0; j < num_names; j++) {
         if (early_del[j]) {
             plan_append(perm, &plan, OP_DELETE, oldnames[j], (s8){0});
         }
     }
 
-    // Phase B2: direct renames
-    // Use final_dest which already contains correct destinations (with ~ for duplicates)
     for (iz i = 0; i < num_names; i++) {
-        if (!is_move[i]) continue;
+        s8 n = newnames[i];
+        if (s8equals(oldnames[i], n) || !n.s || !n.len) continue;
         
-        // Duplicates always do direct renames (they don't interfere with cycles)
-        // Non-duplicates do direct renames if destination is free or will be freed
-        if (is_dup_target[i] || 
-            owner[i] == NEXT_OUTSIDE || 
-            (owner[i] != NEXT_OUTSIDE && early_del[owner[i]])) {
+        b32 is_duplicate = !s8equals(final_dest[i], n);
+        if (is_duplicate || owner[i] == NEXT_OUTSIDE || early_del[owner[i]]) {
             plan_append(perm, &plan, OP_RENAME, oldnames[i], final_dest[i]);
         }
     }
 
-    // Phase C: unstash (only regular cycle-related stashes)
-    // Duplicate targets were handled via direct renames in phase B2
     for (iz k = stashed_len; k-- > 0;) {
         i32 i = stashed[k];
         plan_append(perm, &plan, OP_UNSTASH, (s8){0}, final_dest[i]);
     }
 
-    // Phase D: remaining deletes
     for (iz i = 0; i < num_names; i++) {
-        if (is_delete[i] && !early_del[i]) {
+        s8 n = newnames[i];
+        if ((!n.s || n.len == 0) && !early_del[i]) {
             plan_append(perm, &plan, OP_DELETE, oldnames[i], (s8){0});
         }
     }
