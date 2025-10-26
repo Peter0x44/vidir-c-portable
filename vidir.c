@@ -240,30 +240,28 @@ static b32  os_path_exists(arena scratch, s8 path);
 // File system state tracker to cache OS queries
 typedef struct {
     pathmap *existing_files;  // Maps path -> 1 if file exists
-    arena *perm;
 } fsstate;
 
 static fsstate *new_fsstate(arena *perm)
 {
     fsstate *fs = new(perm, fsstate, 1);
     fs->existing_files = 0;
-    fs->perm = perm;
     return fs;
 }
 
-static void fsstate_mark_exists(fsstate *fs, s8 path)
+static void fsstate_mark_exists(fsstate *fs, s8 path, arena *perm)
 {
-    iz *exists = pathmap_insert(&fs->existing_files, path, fs->perm);
+    iz *exists = pathmap_insert(&fs->existing_files, path, perm);
     *exists = 1;
 }
 
-static void fsstate_mark_deleted(fsstate *fs, s8 path)
+static void fsstate_mark_deleted(fsstate *fs, s8 path, arena *perm)
 {
-    iz *exists = pathmap_insert(&fs->existing_files, path, fs->perm);
+    iz *exists = pathmap_insert(&fs->existing_files, path, perm);
     *exists = 0;
 }
 
-static b32 fsstate_exists(fsstate *fs, s8 path)
+static b32 fsstate_exists(fsstate *fs, s8 path, arena *perm)
 {
     iz *exists = pathmap_lookup(&fs->existing_files, path);
     if (exists) {
@@ -271,26 +269,26 @@ static b32 fsstate_exists(fsstate *fs, s8 path)
     }
     
     // First time seeing this path - query OS once and cache result
-    arena scratch = *fs->perm;
+    arena scratch = *perm;
     b32 file_exists = os_path_exists(scratch, path);
     
     // Cache the result
-    iz *cached = pathmap_insert(&fs->existing_files, path, fs->perm);
+    iz *cached = pathmap_insert(&fs->existing_files, path, perm);
     *cached = file_exists ? 1 : 0;
     
     return file_exists;
 }
 
 // Generate a unique non-conflicting name for a file
-static s8 fsstate_unique_name(fsstate *fs, s8 base_path)
+static s8 fsstate_unique_name(fsstate *fs, s8 base_path, arena *perm)
 {
-    if (!fsstate_exists(fs, base_path)) {
+    if (!fsstate_exists(fs, base_path, perm)) {
         return base_path;  // No conflict
     }
     
     // Try base_path~, base_path~1, base_path~2, etc.
     iz max_len = base_path.len + 20;  // Room for ~999999...
-    u8 *candidate = new(fs->perm, u8, max_len);
+    u8 *candidate = new(perm, u8, max_len);
     
     // Copy base path
     for (iz i = 0; i < base_path.len; i++) {
@@ -299,7 +297,7 @@ static s8 fsstate_unique_name(fsstate *fs, s8 base_path)
     candidate[base_path.len] = '~';
     
     s8 candidate_path = {candidate, base_path.len + 1};
-    if (!fsstate_exists(fs, candidate_path)) {
+    if (!fsstate_exists(fs, candidate_path, perm)) {
         return candidate_path;
     }
     
@@ -322,7 +320,7 @@ static s8 fsstate_unique_name(fsstate *fs, s8 base_path)
         }
         
         candidate_path.len = pos + digit_count;
-        if (!fsstate_exists(fs, candidate_path)) {
+        if (!fsstate_exists(fs, candidate_path, perm)) {
             return candidate_path;
         }
         
@@ -803,7 +801,7 @@ static b32 execute_plan(Plan plan, arena scratch, os *ctx, u8buf *out, u8buf *er
     for (iz i = 0; i < plan.len; i++) {
         Action a = plan.actions[i];
         if ((a.op == OP_RENAME || a.op == OP_UNSTASH) && a.dst.s && a.dst.len) {
-            fsstate_mark_exists(fs, a.dst);
+            fsstate_mark_exists(fs, a.dst, &scratch);
         }
     }
 
@@ -817,7 +815,7 @@ static b32 execute_plan(Plan plan, arena scratch, os *ctx, u8buf *out, u8buf *er
         switch (a.op) {
         case OP_STASH: {
             // Choose a unique stash name near src
-            s8 stash_name = fsstate_unique_name(fs, a.src);
+            s8 stash_name = fsstate_unique_name(fs, a.src, &scratch);
             // Perform rename
             if (!os_rename_file(ctx, scratch, a.src, stash_name)) {
                 prints8(err, S("vidir: failed to stash: "));
@@ -826,8 +824,8 @@ static b32 execute_plan(Plan plan, arena scratch, os *ctx, u8buf *out, u8buf *er
                 flush(err);
                 return 0;
             }
-            fsstate_mark_deleted(fs, a.src);
-            fsstate_mark_exists(fs, stash_name);
+            fsstate_mark_deleted(fs, a.src, &scratch);
+            fsstate_mark_exists(fs, stash_name, &scratch);
             if (verbose) {
                 prints8(out, S("stash "));
                 prints8(out, a.src);
@@ -858,8 +856,8 @@ static b32 execute_plan(Plan plan, arena scratch, os *ctx, u8buf *out, u8buf *er
                 flush(err);
                 return 0;
             }
-            fsstate_mark_deleted(fs, a.src);
-            fsstate_mark_exists(fs, a.dst);
+            fsstate_mark_deleted(fs, a.src, &scratch);
+            fsstate_mark_exists(fs, a.dst, &scratch);
             if (verbose) {
                 prints8(out, S("rename "));
                 prints8(out, a.src);
@@ -888,8 +886,8 @@ static b32 execute_plan(Plan plan, arena scratch, os *ctx, u8buf *out, u8buf *er
                 flush(err);
                 return 0;
             }
-            fsstate_mark_deleted(fs, stash_name);
-            fsstate_mark_exists(fs, a.dst);
+            fsstate_mark_deleted(fs, stash_name, &scratch);
+            fsstate_mark_exists(fs, a.dst, &scratch);
             if (verbose) {
                 prints8(out, S("unstash "));
                 prints8(out, stash_name);
@@ -901,7 +899,7 @@ static b32 execute_plan(Plan plan, arena scratch, os *ctx, u8buf *out, u8buf *er
         case OP_DELETE: {
             if (!os_delete_path(ctx, scratch, a.src)) {
                 // If already gone, ignore; else report
-                if (fsstate_exists(fs, a.src)) {
+                if (fsstate_exists(fs, a.src, &scratch)) {
                     prints8(err, S("vidir: failed to delete: "));
                     prints8(err, a.src);
                     prints8(err, S("\n"));
@@ -909,7 +907,7 @@ static b32 execute_plan(Plan plan, arena scratch, os *ctx, u8buf *out, u8buf *er
                     return 0;
                 }
             } else {
-                fsstate_mark_deleted(fs, a.src);
+                fsstate_mark_deleted(fs, a.src, &scratch);
             }
             if (verbose) {
                 prints8(out, S("delete "));
