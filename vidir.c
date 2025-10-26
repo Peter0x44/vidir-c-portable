@@ -608,7 +608,7 @@ static void plan_append(arena *perm, Plan *p, Op op, s8 src, s8 dst)
 
 static Plan compute_plan(arena *perm, s8 *oldnames, s8 *newnames, iz num_names)
 {
-    /* Algorithm: Sequence of file operations to transform oldnames -> newnames.
+    /* Algorithm: Generate a sequence of file operations to transform oldnames -> newnames.
      * 
      * The challenge is handling rename cycles (A->B, B->A) and conflicts where destinations are
      * occupied. We solve this by:
@@ -947,7 +947,13 @@ static b32 parse_temp_line(s8 *line, i32 *line_number)
     i32 num = 0;
     for (iz i = 0; i < tab_pos; i++) {
         if (line->s[i] >= '0' && line->s[i] <= '9') {
-            num = num * 10 + (line->s[i] - '0');
+            i32 digit = line->s[i] - '0';
+            if (num > (0x7fffffff - digit) / 10) {
+                // Would overflow
+                return 0;
+            }
+            
+            num = num * 10 + digit;
         } else {
             // Invalid character in number
             return 0;
