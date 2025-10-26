@@ -182,16 +182,16 @@ static b32 startswith(s8 s, s8 prefix)
 }
 
 // String comparison for sorting
-static i32 u8compare(u8 *a, u8 *b, iz n)
+static iz u8compare(u8 *a, u8 *b, iz n)
 {
     for (; n; n--) {
-        i32 d = *a++ - *b++;
+        iz d = *a++ - *b++;
         if (d) return d;
     }
     return 0;
 }
 
-static i32 s8compare_(s8 a, s8 b)
+static iz s8compare_(s8 a, s8 b)
 {
     iz len = a.len<b.len ? a.len : b.len;
     iz r   = u8compare(a.s, b.s, len);
