@@ -118,11 +118,11 @@ typedef struct pathmap pathmap;
 struct pathmap {
     pathmap *child[4];   // 4-way trie
     s8       key;        // the path string
-    i32      value;      // 1-based array index (0 = not found)
+    iz       value;      // 1-based array index (0 = not found)
 };
 
 // Insert or lookup a path in the map (path -> array index)
-static i32 *pathmap_insert(pathmap **m, s8 key, arena *perm)
+static iz *pathmap_insert(pathmap **m, s8 key, arena *perm)
 {
     for (u32 h = s8hash(key); *m; h <<= 2) {
         if (s8equals((*m)->key, key)) {
@@ -140,7 +140,7 @@ static i32 *pathmap_insert(pathmap **m, s8 key, arena *perm)
 }
 
 // Lookup a path in the reverse map
-static i32 *pathmap_lookup(pathmap **m, s8 key)
+static iz *pathmap_lookup(pathmap **m, s8 key)
 {
     return pathmap_insert(m, key, 0);
 }
@@ -253,19 +253,19 @@ static fsstate *new_fsstate(arena *perm)
 
 static void fsstate_mark_exists(fsstate *fs, s8 path)
 {
-    i32 *exists = pathmap_insert(&fs->existing_files, path, fs->perm);
+    iz *exists = pathmap_insert(&fs->existing_files, path, fs->perm);
     *exists = 1;
 }
 
 static void fsstate_mark_deleted(fsstate *fs, s8 path)
 {
-    i32 *exists = pathmap_insert(&fs->existing_files, path, fs->perm);
+    iz *exists = pathmap_insert(&fs->existing_files, path, fs->perm);
     *exists = 0;
 }
 
 static b32 fsstate_exists(fsstate *fs, s8 path)
 {
-    i32 *exists = pathmap_lookup(&fs->existing_files, path);
+    iz *exists = pathmap_lookup(&fs->existing_files, path);
     if (exists) {
         return *exists != 0;
     }
@@ -275,7 +275,7 @@ static b32 fsstate_exists(fsstate *fs, s8 path)
     b32 file_exists = os_path_exists(scratch, path);
     
     // Cache the result
-    i32 *cached = pathmap_insert(&fs->existing_files, path, fs->perm);
+    iz *cached = pathmap_insert(&fs->existing_files, path, fs->perm);
     *cached = file_exists ? 1 : 0;
     
     return file_exists;
@@ -645,13 +645,13 @@ static Plan compute_plan(arena *perm, s8 *oldnames, s8 *newnames, iz num_names)
     pathmap *rev = 0;
     for (iz i = 0; i < num_names; i++) {
         if (oldnames[i].s) {
-            i32 *slot = pathmap_insert(&rev, oldnames[i], perm);
-            *slot = (i32)(i + 1);
+            iz *slot = pathmap_insert(&rev, oldnames[i], perm);
+            *slot = i + 1;
         }
     }
 
     // Compute owner for each destination (who currently owns that path, if anyone)
-    i32 *owner = new(perm, i32, num_names);  // index of owner of destination, or NEXT_OUTSIDE
+    iz *owner = new(perm, iz, num_names);  // index of owner of destination, or NEXT_OUTSIDE
     for (iz i = 0; i < num_names; i++) {
         owner[i] = NEXT_OUTSIDE;
         s8 o = oldnames[i];
@@ -662,7 +662,7 @@ static Plan compute_plan(arena *perm, s8 *oldnames, s8 *newnames, iz num_names)
         if (s8equals(o, n)) continue;
         
         // This is a move - find who owns the destination
-        i32 *pv = pathmap_lookup(&rev, n);
+        iz *pv = pathmap_lookup(&rev, n);
         if (pv && *pv) owner[i] = *pv - 1;
     }
 
@@ -690,8 +690,8 @@ static Plan compute_plan(arena *perm, s8 *oldnames, s8 *newnames, iz num_names)
             final_dest[i] = newnames[i];  // Default: use original target
             s8 n = newnames[i];
             if (n.s && n.len && !s8equals(oldnames[i], n)) {
-                i32 *last = pathmap_insert(&target_last_idx, n, perm);
-                *last = (i32)(i + 1);
+                iz *last = pathmap_insert(&target_last_idx, n, perm);
+                *last = i + 1;
             }
         }
         
@@ -701,18 +701,18 @@ static Plan compute_plan(arena *perm, s8 *oldnames, s8 *newnames, iz num_names)
             // Skip non-moves
             if (s8equals(oldnames[i], target) || !target.s || !target.len) continue;
             
-            i32 *last = pathmap_lookup(&target_last_idx, target);
-            if (!last || *last == (i32)(i + 1)) continue;  // Last occurrence or not found
+            iz *last = pathmap_lookup(&target_last_idx, target);
+            if (!last || *last == i + 1) continue;  // Last occurrence or not found
             
             // This is an earlier duplicate - add ~ suffix
-            i32 *count = pathmap_insert(&dup_count_map, target, perm);
-            i32 suffix_num = (*count)++;
+            iz *count = pathmap_insert(&dup_count_map, target, perm);
+            iz suffix_num = (*count)++;
             
             // Build final path: target~ or target~N
             iz suffix_len = 1;  // For '~'
             if (suffix_num > 0) {
                 // Count digits in suffix_num
-                for (i32 n = suffix_num; n > 0; n /= 10) suffix_len++;
+                for (iz n = suffix_num; n > 0; n /= 10) suffix_len++;
             }
             
             u8 *path = new(perm, u8, target.len + suffix_len);
@@ -722,7 +722,7 @@ static Plan compute_plan(arena *perm, s8 *oldnames, s8 *newnames, iz num_names)
             if (suffix_num > 0) {
                 // Write digits in reverse
                 iz pos = target.len + suffix_len - 1;
-                for (i32 n = suffix_num; n > 0; n /= 10) {
+                for (iz n = suffix_num; n > 0; n /= 10) {
                     path[pos--] = '0' + (n % 10);
                 }
             }
@@ -732,7 +732,7 @@ static Plan compute_plan(arena *perm, s8 *oldnames, s8 *newnames, iz num_names)
     }
 
     // Stash files in cycles, delete blockers, do direct renames, unstash, then remaining deletes
-    i32 *stashed = new(perm, i32, num_names);
+    iz *stashed = new(perm, iz, num_names);
     iz stashed_len = 0;
     for (iz i = 0; i < num_names; i++) {
         s8 n = newnames[i];
@@ -740,7 +740,7 @@ static Plan compute_plan(arena *perm, s8 *oldnames, s8 *newnames, iz num_names)
         if (!s8equals(final_dest[i], n)) continue;  // Skip duplicates (don't create cycles)
         if (owner[i] != NEXT_OUTSIDE && !early_del[owner[i]]) {
             plan_append(perm, &plan, OP_STASH, oldnames[i], (s8){0});
-            stashed[stashed_len++] = (i32)i;
+            stashed[stashed_len++] = i;
         }
     }
 
@@ -761,7 +761,7 @@ static Plan compute_plan(arena *perm, s8 *oldnames, s8 *newnames, iz num_names)
     }
 
     for (iz k = stashed_len; k-- > 0;) {
-        i32 i = stashed[k];
+        iz i = stashed[k];
         plan_append(perm, &plan, OP_UNSTASH, (s8){0}, final_dest[i]);
     }
 
