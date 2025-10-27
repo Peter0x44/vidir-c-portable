@@ -93,8 +93,11 @@ typedef struct {
     iz      cap;
 } Plan;
 
-// Sentinel for owner[] mapping in compute_plan: destination is outside original set
-enum { NEXT_OUTSIDE = -1 };
+enum { 
+    NEXT_OUTSIDE = -1,  // For owner[] mapping: destination is outside original set
+    NO_DEPENDENCY = -1, // For deps[]/rdeps[]: no dependency relationship
+    NOT_FOUND = -1      // For pathmap.value: key not found in map
+};
 
 static u32 s8hash(s8 s)
 {
@@ -118,7 +121,7 @@ typedef struct pathmap pathmap;
 struct pathmap {
     pathmap *child[4];   // 4-way trie
     s8       key;        // the path string
-    iz       value;      // 1-based array index (0 = not found)
+    iz       value;      // 0-based array index (-1 = not found)
 };
 
 // Insert or lookup a path in the map (path -> array index)
@@ -135,7 +138,7 @@ static iz *pathmap_insert(pathmap **m, s8 key, arena *perm)
     }
     *m = new(perm, pathmap, 1);
     (*m)->key = key;
-    (*m)->value = 0;
+    (*m)->value = NOT_FOUND;
     return &(*m)->value;
 }
 
@@ -606,78 +609,43 @@ static void plan_append(arena *perm, Plan *p, Op op, s8 src, s8 dst)
 
 static Plan compute_plan(arena *perm, s8 *oldnames, s8 *newnames, iz num_names)
 {
-    /* Algorithm: Generate a sequence of file operations to transform oldnames -> newnames.
-     * 
-     * The challenge is handling rename cycles (A->B, B->A) and conflicts where destinations are
-     * occupied. We solve this by:
-     * 
-     * 1. Compute final destinations accounting for duplicate targets. When multiple files want
-     *    the same destination, the last one wins and gets the actual path. Earlier duplicates
-     *    get ~ backups: first->file.txt~, second->file.txt~1, third->file.txt~2, etc.
-     *
-     * TODO: Add other options to resolve these conflicts.
-     * 
-     * 2. Identify "blockers" - files being deleted whose current paths are wanted as destinations
-     *    by other files. These blockers must be deleted early (before renames) to free their paths.
-     *    Example: deleting A, but B->A needs that path freed first.
-     * 
-     * 3. Handle rename cycles by temporarily stashing files. When A->B but B's path is occupied
-     *    by a file that's not being deleted early, we can't rename A directly. Instead, stash A
-     *    to a temporary name (A~), do other operations, then unstash to B. The LIFO unstash order
-     *    (reverse of stashing) ensures cyclic dependencies resolve correctly.
-     * 
-     * 4. Execute operations in a specific order:
-     *    - Stash files involved in cycles (to temporary names)
-     *    - Delete blockers early (to free their paths)
-     *    - Direct renames (duplicates, files moving to unoccupied paths, or paths freed by
-     *      early deletes)
-     *    - Unstash in LIFO order (reverse of stashing) to resolve cycles
-     *    - Remaining deletes (files not needed as blockers)
-     */
+/* 
+ * For each file, construct a dependency graph:
+ *   - deps[i]   : index of the file currently blocking file i's target (NO_DEPENDENCY if free)
+ *   - rdeps[i]  : index of the file waiting for file i to move (NO_DEPENDENCY if none)
+ *
+ * Traversal:
+ *   - Follow each file's dependency chain to the last file in the chain 
+ *     (file with no further dependencies).
+ *   - Detect cycles when the chain loops back to the starting file.
+ *   - Break cycles by temporarily stashing the starting file.
+ *   - Resolve the chain backwards via rdeps[] to emit operations in correct order.
+ *
+ */
     
     Plan plan = (Plan){0};
 
     if (num_names <= 0) return plan;
 
-    // Build reverse map: old path -> array index
-    pathmap *rev = 0;
+    // Build lookup map from old names to indices
+    pathmap *oldmap = 0;
     for (iz i = 0; i < num_names; i++) {
-        if (oldnames[i].s) {
-            iz *slot = pathmap_insert(&rev, oldnames[i], perm);
-            *slot = i + 1;
+        if (oldnames[i].s && oldnames[i].len > 0) {
+            iz *slot = pathmap_insert(&oldmap, oldnames[i], perm);
+            *slot = i;
         }
     }
 
-    // Compute owner for each destination (who currently owns that path, if anyone)
-    iz *owner = new(perm, iz, num_names);  // index of owner of destination, or NEXT_OUTSIDE
+    // Build dependency graph
+    // deps[i] = index of file that must move before file i can move (NO_DEPENDENCY if none)
+    // rdeps[i] = index of file that's waiting for file i to move (NO_DEPENDENCY if none)
+    iz *deps = new(perm, iz, num_names);
+    iz *rdeps = new(perm, iz, num_names);
     for (iz i = 0; i < num_names; i++) {
-        owner[i] = NEXT_OUTSIDE;
-        s8 o = oldnames[i];
-        s8 n = newnames[i];
-        
-        // Skip deletes and non-moves
-        if (!n.s || n.len == 0) continue;
-        if (s8equals(o, n)) continue;
-        
-        // This is a move - find who owns the destination
-        iz *pv = pathmap_lookup(&rev, n);
-        if (pv && *pv) owner[i] = *pv - 1;
+        deps[i] = rdeps[i] = NO_DEPENDENCY;
     }
 
-    // Identify blockers that will be deleted early (their path is a destination for someone)
-    u8 *early_del = new(perm, u8, num_names);
-    for (iz j = 0; j < num_names; j++) early_del[j] = 0;
-    for (iz i = 0; i < num_names; i++) {
-        s8 n = newnames[i];
-        // Check if this is a move to an occupied location whose owner is being deleted
-        if (!s8equals(oldnames[i], n) && n.s && n.len != 0 &&
-            owner[i] != NEXT_OUTSIDE && (!newnames[owner[i]].s || newnames[owner[i]].len == 0)) {
-            early_del[owner[i]] = 1;
-        }
-    }
-
-    // Handle duplicate targets: compute final destinations with ~ suffixes
-    // Earlier duplicates get ~, ~1, ~2 etc; last one gets the actual target
+    // Handle duplicate targets: last one wins, earlier ones get ~ suffixes
     s8 *final_dest = new(perm, s8, num_names);
     {
         pathmap *target_last_idx = 0;  // Maps target -> last index wanting it
@@ -689,7 +657,7 @@ static Plan compute_plan(arena *perm, s8 *oldnames, s8 *newnames, iz num_names)
             s8 n = newnames[i];
             if (n.s && n.len && !s8equals(oldnames[i], n)) {
                 iz *last = pathmap_insert(&target_last_idx, n, perm);
-                *last = i + 1;
+                *last = i;
             }
         }
         
@@ -700,10 +668,11 @@ static Plan compute_plan(arena *perm, s8 *oldnames, s8 *newnames, iz num_names)
             if (s8equals(oldnames[i], target) || !target.s || !target.len) continue;
             
             iz *last = pathmap_lookup(&target_last_idx, target);
-            if (!last || *last == i + 1) continue;  // Last occurrence or not found
+            if (!last || *last == i) continue;  // Not found or last occurrence
             
             // This is an earlier duplicate - add ~ suffix
             iz *count = pathmap_insert(&dup_count_map, target, perm);
+            if (*count == NOT_FOUND) *count = 0;  // Initialize counter
             iz suffix_num = (*count)++;
             
             // Build final path: target~ or target~N
@@ -729,44 +698,76 @@ static Plan compute_plan(arena *perm, s8 *oldnames, s8 *newnames, iz num_names)
         }
     }
 
-    // Stash files in cycles, delete blockers, do direct renames, unstash, then remaining deletes
-    iz *stashed = new(perm, iz, num_names);
-    iz stashed_len = 0;
+    // Build dependency relationships
     for (iz i = 0; i < num_names; i++) {
-        s8 n = newnames[i];
-        if (s8equals(oldnames[i], n) || !n.s || !n.len) continue;
-        if (!s8equals(final_dest[i], n)) continue;  // Skip duplicates (don't create cycles)
-        if (owner[i] != NEXT_OUTSIDE && !early_del[owner[i]]) {
-            plan_append(perm, &plan, OP_STASH, oldnames[i], (s8){0});
-            stashed[stashed_len++] = i;
+        s8 dest = final_dest[i];
+        if (!dest.s || dest.len == 0 || s8equals(oldnames[i], dest)) {
+            continue;  // Skip deletes and non-moves
+        }
+
+        // Check if destination is currently occupied by another file
+        iz *blocker = pathmap_lookup(&oldmap, dest);
+        if (blocker && *blocker != i) {
+            // File i depends on file *blocker moving first
+            deps[i] = *blocker;
+            rdeps[*blocker] = i;
         }
     }
 
-    for (iz j = 0; j < num_names; j++) {
-        if (early_del[j]) {
-            plan_append(perm, &plan, OP_DELETE, oldnames[j], (s8){0});
-        }
-    }
-
+    u8 *processed = new(perm, u8, num_names);
     for (iz i = 0; i < num_names; i++) {
-        s8 n = newnames[i];
-        if (s8equals(oldnames[i], n) || !n.s || !n.len) continue;
-        
-        b32 is_duplicate = !s8equals(final_dest[i], n);
-        if (is_duplicate || owner[i] == NEXT_OUTSIDE || early_del[owner[i]]) {
-            plan_append(perm, &plan, OP_RENAME, oldnames[i], final_dest[i]);
-        }
-    }
+        if (processed[i]) continue;  // Already handled this file
 
-    for (iz k = stashed_len; k-- > 0;) {
-        iz i = stashed[k];
-        plan_append(perm, &plan, OP_UNSTASH, (s8){0}, final_dest[i]);
-    }
-
-    for (iz i = 0; i < num_names; i++) {
-        s8 n = newnames[i];
-        if ((!n.s || n.len == 0) && !early_del[i]) {
+        // Handle deletes first
+        if (!final_dest[i].s || final_dest[i].len == 0) {
             plan_append(perm, &plan, OP_DELETE, oldnames[i], (s8){0});
+            processed[i] = 1;
+            continue;
+        }
+
+        // Handle non-moves
+        if (s8equals(oldnames[i], final_dest[i])) {
+            processed[i] = 1;
+            continue;
+        }
+
+        // Handle files with no dependencies
+        if (deps[i] == NO_DEPENDENCY || processed[deps[i]]) {
+            plan_append(perm, &plan, OP_RENAME, oldnames[i], final_dest[i]);
+            processed[i] = 1;
+            continue;
+        }
+
+        // Follow dependency chain to find the end
+        iz last = deps[i];
+        while (deps[last] != NO_DEPENDENCY && deps[last] != i && !processed[deps[last]]) {
+            last = deps[last];
+        }
+
+        b32 cycle_detected = (deps[last] == i);
+        
+        if (cycle_detected) {
+            // Break the cycle by stashing the starting file
+            plan_append(perm, &plan, OP_STASH, oldnames[i], (s8){0});
+            processed[i] = 1;
+        }
+
+        // Process dependency chain in execution order
+        // Start from the end of the chain and work backwards to the beginning
+        while (last != i) {
+            plan_append(perm, &plan, OP_RENAME, oldnames[last], final_dest[last]);
+            processed[last] = 1;
+            last = rdeps[last];  // Move to the file waiting for this one
+            if (last == NO_DEPENDENCY) break;  // Chain is broken
+        }
+
+        if (cycle_detected) {
+            // Complete the cycle by unstashing to final destination
+            plan_append(perm, &plan, OP_UNSTASH, (s8){0}, final_dest[i]);
+        } else {
+            // No cycle - just rename the starting file
+            plan_append(perm, &plan, OP_RENAME, oldnames[i], final_dest[i]);
+            processed[i] = 1;
         }
     }
 
@@ -774,30 +775,13 @@ static Plan compute_plan(arena *perm, s8 *oldnames, s8 *newnames, iz num_names)
 }
 
 // Execute the plan 
-// Helpers for stash stack
-static void stash_push(arena *scratch, s8 **stack, iz *len, s8 path)
-{
-    s8 *arr = new(scratch, s8, *len + 1);
-    for (iz i = 0; i < *len; i++) arr[i] = (*stack)[i];
-    arr[*len] = path;
-    *stack = arr;
-    (*len)++;
-}
-
-static s8 stash_pop(s8 **stack, iz *len)
-{
-    assert(*len > 0);
-    s8 r = (*stack)[*len - 1];
-    (*len)--;
-    return r;
-}
 
 static b32 execute_plan(Plan plan, arena scratch, os *ctx, u8buf *out, u8buf *err, b32 verbose)
 {
-    // Track filesystem state and stash stack
+    // Track filesystem state for existence queries
     fsstate *fs = new_fsstate(&scratch);
 
-    // Reserve all destination paths first to avoid stash collisions with final targets
+    // Reserve all destination paths first to avoid temp name collisions
     for (iz i = 0; i < plan.len; i++) {
         Action a = plan.actions[i];
         if ((a.op == OP_RENAME || a.op == OP_UNSTASH) && a.dst.s && a.dst.len) {
@@ -805,35 +789,39 @@ static b32 execute_plan(Plan plan, arena scratch, os *ctx, u8buf *out, u8buf *er
         }
     }
 
-    // Simple LIFO stash of temporary names
-    s8 *stash_stack = 0;
-    iz stash_len = 0;
+    s8 temp_name = {0};  // Will be generated on first STASH operation
 
     // Execute each action
     for (iz i = 0; i < plan.len; i++) {
         Action a = plan.actions[i];
         switch (a.op) {
         case OP_STASH: {
-            // Choose a unique stash name near src
-            s8 stash_name = fsstate_unique_name(fs, a.src, &scratch);
-            // Perform rename
-            if (!os_rename_file(ctx, scratch, a.src, stash_name)) {
+            // Generate temporary name on first use
+            if (!temp_name.s) {
+                temp_name = fsstate_unique_name(fs, S(".vidir_temp"), &scratch);
+            }
+            
+            // Move file to temporary location
+            if (!os_rename_file(ctx, scratch, a.src, temp_name)) {
                 prints8(err, S("vidir: failed to stash: "));
                 prints8(err, a.src);
+                prints8(err, S(" -> "));
+                prints8(err, temp_name);
                 prints8(err, S("\n"));
                 flush(err);
                 return 0;
             }
+            
             fsstate_mark_deleted(fs, a.src, &scratch);
-            fsstate_mark_exists(fs, stash_name, &scratch);
+            fsstate_mark_exists(fs, temp_name, &scratch);
+            
             if (verbose) {
                 prints8(out, S("stash "));
                 prints8(out, a.src);
                 prints8(out, S(" -> "));
-                prints8(out, stash_name);
+                prints8(out, temp_name);
                 prints8(out, S("\n"));
             }
-            stash_push(&scratch, &stash_stack, &stash_len, stash_name);
         } break;
         case OP_RENAME: {
             // Ensure destination directory exists
@@ -867,7 +855,13 @@ static b32 execute_plan(Plan plan, arena scratch, os *ctx, u8buf *out, u8buf *er
             }
         } break;
         case OP_UNSTASH: {
-            s8 stash_name = stash_pop(&stash_stack, &stash_len);
+            // Move from temporary location to final destination
+            // temp_name should have been set by a previous STASH operation
+            if (!temp_name.s) {
+                prints8(err, S("vidir: unstash without prior stash\n"));
+                flush(err);
+                return 0;
+            }
 
             // Ensure destination directory exists
             s8 dir = dirname_s8(a.dst);
@@ -879,18 +873,22 @@ static b32 execute_plan(Plan plan, arena scratch, os *ctx, u8buf *out, u8buf *er
                 return 0;
             }
 
-            if (!os_rename_file(ctx, scratch, stash_name, a.dst)) {
-                prints8(err, S("vidir: failed to unstash into: "));
+            if (!os_rename_file(ctx, scratch, temp_name, a.dst)) {
+                prints8(err, S("vidir: failed to unstash: "));
+                prints8(err, temp_name);
+                prints8(err, S(" -> "));
                 prints8(err, a.dst);
                 prints8(err, S("\n"));
                 flush(err);
                 return 0;
             }
-            fsstate_mark_deleted(fs, stash_name, &scratch);
+            
+            fsstate_mark_deleted(fs, temp_name, &scratch);
             fsstate_mark_exists(fs, a.dst, &scratch);
+            
             if (verbose) {
                 prints8(out, S("unstash "));
-                prints8(out, stash_name);
+                prints8(out, temp_name);
                 prints8(out, S(" -> "));
                 prints8(out, a.dst);
                 prints8(out, S("\n"));
@@ -918,7 +916,6 @@ static b32 execute_plan(Plan plan, arena scratch, os *ctx, u8buf *out, u8buf *er
         }
     }
 
-    (void)out; (void)verbose; // Currently unused
     return 1;
 }
 
@@ -982,7 +979,7 @@ static void vidir(config *conf)
     b32 verbose = 0;
     b32 read_from_stdin = 0;
     
-    // Set up buffered output (like u-config)
+    // Set up buffered output
     u8buf *out = newfdbuf(perm, 1, 4096);  // stdout
     u8buf *err = newfdbuf(perm, 2, 4096);  // stderr
     u8buf *tmp = newfdbuf(perm, 3, 4096);  // temp file
