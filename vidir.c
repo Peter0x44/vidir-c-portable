@@ -342,6 +342,7 @@ static s8node *os_list_dir(arena *, s8 path);
 static b32  os_invoke_editor(os *ctx, arena scratch);
 static void os_close_temp_file(os *ctx);
 static void os_open_temp_file(os *ctx);
+static void os_remove_temp_file(os *ctx);
 static b32  os_rename_file(os *ctx, arena scratch, s8 src, s8 dst);
 static b32  os_delete_path(os *ctx, arena scratch, s8 path);
 static b32  os_create_dir(os *ctx, arena scratch, s8 path);
@@ -1155,6 +1156,8 @@ static void vidir(config *conf)
     scratch = *perm;
     scratch.beg = perm->beg;  // Start scratch from current position, don't overlap permanent data
     b32 success = execute_plan(plan, scratch, perm->ctx, out, err, verbose);
+    
+    os_remove_temp_file(perm->ctx);
     
     flush(out);
     flush(err);
