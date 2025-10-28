@@ -977,6 +977,7 @@ static void vidir(config *);
 static void vidir(config *conf)
 {
     arena *perm = &conf->perm;
+    byte *arena_start = perm->beg;
     b32 verbose = 0;
     b32 read_from_stdin = 0;
     
@@ -1159,6 +1160,18 @@ static void vidir(config *conf)
     
     os_remove_temp_file(perm->ctx);
     
+#ifdef PRINT_MEMUSAGE
+    iz memory_used = perm->beg - arena_start;
+    iz avg_per_file = memory_used / original_name_count;
+    prints8(err, S("vidir: used "));
+    printi64(err, (i64)memory_used);
+    prints8(err, S(" bytes total ("));
+    printi64(err, (i64)avg_per_file);
+    prints8(err, S(" bytes per file, "));
+    printi64(err, (i64)original_name_count);
+    prints8(err, S(" files)\n"));
+#endif
+
     flush(out);
     flush(err);
     
