@@ -42,7 +42,6 @@ typedef struct {
     i32   nargs;        // number of arguments
 } config;
 
-
 static byte *alloc(arena *a, iz size, iz count, iz align)
 {
     iz pad = -(ptrdiff_t)a->beg & (align - 1);
@@ -71,6 +70,16 @@ static s8 s8fromcstr(u8 *z)
         for (; s.s[s.len]; s.len++) {}
     }
     return s;
+}
+
+// Append a string to a linked list of strings
+static s8node **s8list_append(arena *perm, s8node **tail, s8 str)
+{
+    s8node *node = new(perm, s8node, 1);
+    node->str = str;
+    node->next = 0;
+    *tail = node;
+    return &node->next;
 }
 
 // Operation types for file rename plan
@@ -988,10 +997,12 @@ static void vidir(config *conf)
     u8input *input = newinput(perm, 3, 4096);  // reading back from temp file
     u8input *stdin_input = newinput(perm, 0, 4096); // stdin reading
     
-    s8 *paths = 0;
+    // Use linked list to collect paths
+    s8node *paths_head = 0;
+    s8node **paths_tail = &paths_head;
     i32 paths_count = 0;
 
-    // First pass: collect all path arguments (don't expand directories yet)
+    // Process command line arguments
     if (conf->nargs > 0) {
         for (i32 i = 0; i < conf->nargs; i++) {
             s8 arg = s8fromcstr(conf->args[i]);
@@ -1010,25 +1021,35 @@ static void vidir(config *conf)
                     os_exit(1);
                 }
             } else {
-                // Add path as-is, we'll expand directories later
-                s8 *new_paths = new(perm, s8, paths_count + 1);
-                for (i32 j = 0; j < paths_count; j++) {
-                    new_paths[j] = paths[j];
+                if (os_path_is_dir(*perm, arg)) {
+                    // this is a directory - expand it and sort the entries
+                    s8node *entries = os_list_dir(perm, arg);
+                    entries = s8sort_(entries);
+                    while (entries) {
+                        *paths_tail = entries;
+                        paths_tail = &entries->next;
+                        paths_count++;
+                        entries = entries->next;
+                    }
+                } else {
+                    // file - path as-is
+                    paths_tail = s8list_append(perm, paths_tail, arg);
+                    paths_count++;
                 }
-                new_paths[paths_count] = arg;
-                paths = new_paths;
-                paths_count++;
             }
         }
     }
     
     // No paths provided and not reading from stdin, default to .
     if (paths_count == 0 && !read_from_stdin) {
-        s8 current_dir = S(".");
-        s8 *new_paths = new(perm, s8, paths_count + 1);
-        new_paths[0] = current_dir;
-        paths = new_paths;
-        paths_count = 1;
+        s8node *entries = os_list_dir(perm, S("."));
+        entries = s8sort_(entries);
+        while (entries) {
+            *paths_tail = entries;
+            paths_tail = &entries->next;
+            paths_count++;
+            entries = entries->next;
+        }
     }
 
     // Read from stdin if requested
@@ -1053,52 +1074,30 @@ static void vidir(config *conf)
             }
             s8 path = {line_copy, line.len};
             
-            // Reallocate paths array with one more slot
-            s8 *new_paths = new(perm, s8, paths_count + 1);
-            for (i32 j = 0; j < paths_count; j++) {
-                new_paths[j] = paths[j];
+            if (os_path_is_dir(*perm, path)) {
+                // this is a directory - expand it and sort the entries
+                s8node *entries = os_list_dir(perm, path);
+                entries = s8sort_(entries);
+                while (entries) {
+                    *paths_tail = entries;
+                    paths_tail = &entries->next;
+                    paths_count++;
+                    entries = entries->next;
+                }
+            } else {
+                // File, append as-is
+                paths_tail = s8list_append(perm, paths_tail, path);
+                paths_count++;
             }
-            new_paths[paths_count] = path;
-            paths = new_paths;
-            paths_count++;
         }
     }
 
-    // Now expand any directories in the collected paths
-    s8 *final_paths = 0;
-    i32 final_count = 0;
-    
-    for (i32 i = 0; i < paths_count; i++) {
-        if (os_path_is_dir(*perm, paths[i])) {
-            // Expand directory contents
-            s8node *entries = os_list_dir(perm, paths[i]);
-            entries = s8sort_(entries);  // Sort directory listings
-            while (entries) {
-                // Reallocate final_paths array with one more slot
-                s8 *new_final = new(perm, s8, final_count + 1);
-                for (i32 j = 0; j < final_count; j++) {
-                    new_final[j] = final_paths[j];
-                }
-                new_final[final_count] = entries->str;
-                final_paths = new_final;
-                final_count++;
-                entries = entries->next;
-            }
-        } else {
-            // Regular file, add as-is
-            s8 *new_final = new(perm, s8, final_count + 1);
-            for (i32 j = 0; j < final_count; j++) {
-                new_final[j] = final_paths[j];
-            }
-            new_final[final_count] = paths[i];
-            final_paths = new_final;
-            final_count++;
-        }
+    // Convert linked list to array for indexing
+    s8 *paths = new(perm, s8, paths_count);
+    i32 idx = 0;
+    for (s8node *n = paths_head; n; n = n->next) {
+        paths[idx++] = n->str;
     }
-    
-    // Use the expanded paths
-    paths = final_paths;
-    paths_count = final_count;
 
     // Filter out . and .. entries and write to temporary file
     s8 *original_names = new(perm, s8, paths_count);
