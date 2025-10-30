@@ -62,6 +62,29 @@ static byte *alloc(arena *a, iz size, iz count, iz align)
     return p;
 }
 
+#define plan_push(a, s) \
+  ((s)->len == (s)->cap \
+    ? (s)->actions = push_((a), (s)->actions, &(s)->cap, \
+          sizeof(*(s)->actions), _Alignof(__typeof__(*(s)->actions))), \
+      (s)->actions + (s)->len++ \
+    : (s)->actions + (s)->len++)
+
+static void *push_(arena *a, void *data, iz *pcap, iz size, iz align)
+{
+    iz cap = *pcap;
+    if (a->beg != (byte *)data + cap*size) {
+        void *copy = alloc(a, size, cap, align);
+        for (iz i = 0; i < cap*size; i++) {
+            ((byte *)copy)[i] = ((byte *)data)[i];
+        }
+        data = copy;
+    }
+    iz extend = cap ? cap : 4;
+    alloc(a, size, extend, align);
+    *pcap = cap + extend;
+    return data;
+}
+
 static s8 s8fromcstr(u8 *z)
 {
     s8 s = {0};
@@ -603,18 +626,10 @@ static s8 *parse_temp_file(arena *perm, u8input *input, iz original_name_count, 
 }
 
 // Produce a sequence of operations necessary to achieve the new name set.
-// Helper: append an action to a plan (arena grows, simple copy-on-append)
+// Helper: append an action to a plan using the push macro
 static void plan_append(arena *perm, Plan *p, Op op, s8 src, s8 dst)
 {
-    // Amortized growth
-    if (p->len >= p->cap) {
-        iz new_cap = p->cap ? p->cap * 2 : 8;
-        Action *arr = new(perm, Action, new_cap);
-        for (iz i = 0; i < p->len; i++) arr[i] = p->actions[i];
-        p->actions = arr;
-        p->cap = new_cap;
-    }
-    p->actions[p->len++] = (Action){op, src, dst};
+    *plan_push(perm, p) = (Action){op, src, dst};
 }
 
 static Plan compute_plan(arena *perm, s8 *oldnames, s8 *newnames, iz num_names)
