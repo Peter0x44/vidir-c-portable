@@ -329,7 +329,7 @@ static i32 os_read(os *ctx, i32 fd, u8 *buf, i32 len)
     return bytesRead;
 }
 
-static b32 os_path_is_dir(arena scratch, s8 path)
+static b32 os_path_is_dir(os *ctx, arena scratch, s8 path)
 {
     s16 wpath = towide_(&scratch, path);
     i32 attr = GetFileAttributesW(wpath.s);
@@ -342,7 +342,7 @@ static b32 os_path_is_dir(arena scratch, s8 path)
     return (attr & FILE_ATTRIBUTE_DIRECTORY) != 0;
 }
 
-static b32 os_path_exists(arena scratch, s8 path)
+static b32 os_path_exists(os *ctx, arena scratch, s8 path)
 {
     s16 wpath = towide_(&scratch, path);
     i32 attr = GetFileAttributesW(wpath.s);
@@ -350,7 +350,7 @@ static b32 os_path_exists(arena scratch, s8 path)
     return attr != -1;  // Path exists (file or directory)
 }
 
-static s8node *os_list_dir(arena *perm, s8 path)
+static s8node *os_list_dir(os *ctx, arena *perm, s8 path)
 {
     arena scratch = *perm;
     
@@ -717,7 +717,7 @@ static b32 os_rename_file(os *ctx, arena scratch, s8 src, s8 dst)
 }
 
 // Exit the program with the given exit code
-static void os_exit(i32 code)
+static void os_exit(os *ctx, i32 code)
 {
     ExitProcess(code);
 }

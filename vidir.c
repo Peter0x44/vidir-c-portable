@@ -270,17 +270,19 @@ static s8node *s8sort_(s8node *head)
     return rhead;
 }
 
-static b32  os_path_exists(arena scratch, s8 path);
+static b32  os_path_exists(os *ctx, arena scratch, s8 path);
 
 // File system state tracker to cache OS queries
 typedef struct {
     pathmap *existing_files;  // Maps path -> 1 if file exists
+    os      *ctx;
 } fsstate;
 
-static fsstate *new_fsstate(arena *perm)
+static fsstate *new_fsstate(os *ctx, arena *perm)
 {
     fsstate *fs = new(perm, fsstate, 1);
     fs->existing_files = 0;
+    fs->ctx = ctx;
     return fs;
 }
 
@@ -305,7 +307,7 @@ static b32 fsstate_exists(fsstate *fs, s8 path, arena *perm)
     
     // First time seeing this path - query OS once and cache result
     arena scratch = *perm;
-    b32 file_exists = os_path_exists(scratch, path);
+    b32 file_exists = os_path_exists(fs->ctx, scratch, path);
     
     // Cache the result
     iz *cached = pathmap_insert(&fs->existing_files, path, perm);
@@ -368,9 +370,9 @@ static s8 fsstate_unique_name(fsstate *fs, s8 base_path, arena *perm)
 
 static void os_write(os *, i32 fd, s8);
 static i32  os_read(os *, i32 fd, u8 *, i32);
-static b32  os_path_is_dir(arena scratch, s8 path);
-static b32  os_path_exists(arena scratch, s8 path);
-static s8node *os_list_dir(arena *, s8 path);
+static b32  os_path_is_dir(os *ctx, arena scratch, s8 path);
+static b32  os_path_exists(os *ctx, arena scratch, s8 path);
+static s8node *os_list_dir(os *ctx, arena *perm, s8 path);
 static b32  os_invoke_editor(os *ctx, arena scratch);
 static void os_close_temp_file(os *ctx);
 static void os_open_temp_file(os *ctx);
@@ -378,7 +380,7 @@ static void os_remove_temp_file(os *ctx);
 static b32  os_rename_file(os *ctx, arena scratch, s8 src, s8 dst);
 static b32  os_delete_path(os *ctx, arena scratch, s8 path);
 static b32  os_create_dir(os *ctx, arena scratch, s8 path);
-static void os_exit(i32 code);
+static void os_exit(os *ctx, i32 code);
 
 typedef struct {
     arena *perm;
@@ -593,14 +595,14 @@ static s8 *parse_temp_file(arena *perm, u8input *input, iz original_name_count, 
         if (!parse_temp_line(&line_copy, &parsed_line_num)) {
             prints8(err, S("vidir: unable to parse line, aborting\n"));
             flush(err);
-            os_exit(1);
+            os_exit(perm->ctx, 1);
         }
         
         // Check if line number is in valid range [1, original_name_count]
         if (parsed_line_num < 1 || parsed_line_num > original_name_count) {
             prints8(err, S("vidir: unknown item number\n"));
             flush(err);
-            os_exit(1);
+            os_exit(perm->ctx, 1);
         }
         
         // Copy the path to permanent memory
@@ -615,7 +617,7 @@ static s8 *parse_temp_file(arena *perm, u8input *input, iz original_name_count, 
         if (seen[idx]) {
             prints8(err, S("vidir: duplicate item number in temp file\n"));
             flush(err);
-            os_exit(1);
+            os_exit(perm->ctx, 1);
         }
         seen[idx] = 1;
         s8 parsed_path = {path_copy, line_copy.len};
@@ -804,7 +806,7 @@ static Plan compute_plan(arena *perm, s8 *oldnames, s8 *newnames, iz num_names)
 static b32 execute_plan(Plan plan, arena scratch, os *ctx, u8buf *out, u8buf *err, b32 verbose)
 {
     // Track filesystem state for existence queries
-    fsstate *fs = new_fsstate(&scratch);
+    fsstate *fs = new_fsstate(ctx, &scratch);
 
     // Reserve all destination paths first to avoid temp name collisions
     for (iz i = 0; i < plan.len; i++) {
@@ -1033,12 +1035,12 @@ static void vidir(config *conf)
                     prints8(err, arg);
                     prints8(err, S("\n"));
                     flush(err);
-                    os_exit(1);
+                    os_exit(perm->ctx, 1);
                 }
             } else {
-                if (os_path_is_dir(*perm, arg)) {
+                if (os_path_is_dir(perm->ctx, *perm, arg)) {
                     // this is a directory - expand it and sort the entries
-                    s8node *entries = os_list_dir(perm, arg);
+                    s8node *entries = os_list_dir(perm->ctx, perm, arg);
                     entries = s8sort_(entries);
                     while (entries) {
                         *paths_tail = entries;
@@ -1057,7 +1059,7 @@ static void vidir(config *conf)
     
     // No paths provided and not reading from stdin, default to .
     if (paths_count == 0 && !read_from_stdin) {
-        s8node *entries = os_list_dir(perm, S("."));
+        s8node *entries = os_list_dir(perm->ctx, perm, S("."));
         entries = s8sort_(entries);
         while (entries) {
             *paths_tail = entries;
@@ -1089,9 +1091,9 @@ static void vidir(config *conf)
             }
             s8 path = {line_copy, line.len};
             
-            if (os_path_is_dir(*perm, path)) {
+            if (os_path_is_dir(perm->ctx, *perm, path)) {
                 // this is a directory - expand it and sort the entries
-                s8node *entries = os_list_dir(perm, path);
+                s8node *entries = os_list_dir(perm->ctx, perm, path);
                 entries = s8sort_(entries);
                 while (entries) {
                     *paths_tail = entries;
