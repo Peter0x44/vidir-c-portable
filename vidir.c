@@ -42,18 +42,19 @@ typedef struct {
     i32   nargs;        // number of arguments
 } config;
 
+static void os_write(os *, i32 fd, s8);
+static void os_exit(os *, i32 code);
+
 static byte *alloc(arena *a, iz size, iz count, iz align)
 {
     iz pad = -(ptrdiff_t)a->beg & (align - 1);
+    iz avail = (a->end - a->beg) - pad;
+    if (count > avail/size) {
+        // Integer overflow or out of memory
+        os_write(a->ctx, 2, S("vidir: out of memory\n"));
+        os_exit(a->ctx, 1);
+    }
     iz total = size * count;
-    if (count > 0 && total/count != size) {
-        // Integer overflow
-        assert(0);
-    }
-    if (total > (a->end - a->beg) - pad) {
-        // Out of memory  
-        assert(0);
-    }
     byte *p = a->beg + pad;
     a->beg += pad + total;
     for (iz i = 0; i < total; i++) {
