@@ -202,14 +202,16 @@ struct os {
     c16 *temp_file_path_w;  // UTF-16 path to temp file
 };
 
-static arena newarena_(iz cap)
+static arena newarena_(os *ctx, iz cap)
 {
     arena arena = {0};
     arena.beg = VirtualAlloc(0, cap, MEM_COMMIT|MEM_RESERVE, PAGE_READWRITE);
     if (!arena.beg) {
-        assert(0 && "TODO: Add better error: failed to allocate arena");
+        os_write(ctx, 2, S("vidir: failed to allocate memory\n"));
+        os_exit(ctx, 1);
     }
     arena.end = arena.beg + cap;
+    arena.ctx = ctx;
     return arena;
 }
 
@@ -232,8 +234,7 @@ static s16 fromenv_w(arena *perm, c16 *name)
 
 static config *newconfig_(os *ctx)
 {
-    arena perm = newarena_(1<<23);
-    perm.ctx = ctx;
+    arena perm = newarena_(ctx, 1<<23);
     config *conf = new(&perm, config, 1);
     conf->perm = perm;
         
@@ -436,16 +437,14 @@ static void os_create_temp_file(os *ctx, arena *perm)
     c16 temp_dir[261];
     i32 temp_dir_len = GetTempPathW(260, temp_dir);
     if (temp_dir_len == 0) {
-        assert(0 && "TODO: Exit if this happens");
-        ctx->handles[3].err = 1;
-        return;
+        os_write(ctx, 2, S("vidir: failed to get temp directory\n"));
+        os_exit(ctx, 1);
     }
     
     c16 temp_file[261];
     if (!GetTempFileNameW(temp_dir, L"vdr", 0, temp_file)) {
-        ctx->handles[3].err = 1;
-        assert(0 && "TODO: Exit if this happens");
-        return;
+        os_write(ctx, 2, S("vidir: failed to create temp file name\n"));
+        os_exit(ctx, 1);
     }
     
     i32 path_len = 0;
@@ -468,8 +467,8 @@ static void os_create_temp_file(os *ctx, arena *perm)
     );
     
     if (ctx->handles[3].h == INVALID_HANDLE_VALUE) {
-        ctx->handles[3].err = 1;
-        assert(0 && "TODO: Exit if this happens");
+        os_write(ctx, 2, S("vidir: failed to open temp file for writing\n"));
+        os_exit(ctx, 1);
     }
     
     ctx->handles[3].isconsole = 0;
@@ -504,9 +503,8 @@ static void os_open_temp_file(os *ctx)
     );
     
     if (ctx->handles[3].h == INVALID_HANDLE_VALUE) {
-        ctx->handles[3].err = 1;
-        assert(0 && "TODO: exit when this happens");
-        return;
+        os_write(ctx, 2, S("vidir: failed to open temp file for reading\n"));
+        os_exit(ctx, 1);
     }
     
     ctx->handles[3].isconsole = 0;
