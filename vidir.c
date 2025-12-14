@@ -1193,6 +1193,6 @@ static void vidir(config *conf)
     flush(err);
     
     if (!success) {
-        // TODO: Could set exit code here
+        os_exit(perm->ctx, 1);
     }
 }
