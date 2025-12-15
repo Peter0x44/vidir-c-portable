@@ -159,6 +159,43 @@ struct pathmap {
     iz       value;      // 0-based array index (-1 = not found)
 };
 
+// Combined value type for duplicate target tracking
+typedef struct {
+    iz last_idx;   // Last index wanting this target
+    iz dup_count;  // Count of duplicates seen
+} dup_target;
+
+typedef struct dup_target_map dup_target_map;
+struct dup_target_map {
+    dup_target_map *child[4];  // 4-way trie
+    s8              key;
+    dup_target      value;
+};
+
+// Insert or lookup in dup_target_map
+static dup_target *dup_target_map_insert(dup_target_map **m, s8 key, arena *perm)
+{
+    for (u32 h = s8hash(key); *m; h <<= 2) {
+        if (s8equals((*m)->key, key)) {
+            return &(*m)->value;
+        }
+        m = &(*m)->child[h>>30];
+    }
+    if (!perm) {
+        return 0;
+    }
+    *m = new(perm, dup_target_map, 1);
+    (*m)->key = key;
+    (*m)->value.last_idx = NOT_FOUND;
+    (*m)->value.dup_count = NOT_FOUND;
+    return &(*m)->value;
+}
+
+static dup_target *dup_target_map_lookup(dup_target_map **m, s8 key)
+{
+    return dup_target_map_insert(m, key, 0);
+}
+
 // Insert or lookup a path in the map (path -> array index)
 static iz *pathmap_insert(pathmap **m, s8 key, arena *perm)
 {
@@ -678,16 +715,15 @@ static Plan compute_plan(arena *perm, s8 *oldnames, s8 *newnames, iz num_names)
     // Handle duplicate targets: last one wins, earlier ones get ~ suffixes
     s8 *final_dest = new(perm, s8, num_names);
     {
-        pathmap *target_last_idx = 0;  // Maps target -> last index wanting it
-        pathmap *dup_count_map = 0;    // Maps target -> count of duplicates seen
+        dup_target_map *dup_map = 0;  // Maps target -> (last_idx, dup_count)
         
         // Find last occurrence of each target
         for (iz i = 0; i < num_names; i++) {
             final_dest[i] = newnames[i];  // Default: use original target
             s8 n = newnames[i];
             if (n.s && n.len && !s8equals(oldnames[i], n)) {
-                iz *last = pathmap_insert(&target_last_idx, n, perm);
-                *last = i;
+                dup_target *info = dup_target_map_insert(&dup_map, n, perm);
+                info->last_idx = i;
             }
         }
         
@@ -697,13 +733,12 @@ static Plan compute_plan(arena *perm, s8 *oldnames, s8 *newnames, iz num_names)
             // Skip non-moves
             if (s8equals(oldnames[i], target) || !target.s || !target.len) continue;
             
-            iz *last = pathmap_lookup(&target_last_idx, target);
-            if (!last || *last == i) continue;  // Not found or last occurrence
+            dup_target *info = dup_target_map_lookup(&dup_map, target);
+            if (!info || info->last_idx == i) continue;  // Not found or last occurrence
             
             // This is an earlier duplicate - add ~ suffix
-            iz *count = pathmap_insert(&dup_count_map, target, perm);
-            if (*count == NOT_FOUND) *count = 0;  // Initialize counter
-            iz suffix_num = (*count)++;
+            if (info->dup_count == NOT_FOUND) info->dup_count = 0;  // Initialize counter
+            iz suffix_num = info->dup_count++;
             
             // Build final path: target~ or target~N
             iz suffix_len = 1;  // For '~'
