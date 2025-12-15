@@ -2,6 +2,7 @@
 // This is free and unencumbered software released into the public domain.
 
 #include <stddef.h>
+#include <stdint.h>
 
 typedef unsigned char    u8;
 typedef   signed int     b32;
@@ -9,6 +10,7 @@ typedef   signed int     i32;
 typedef unsigned int     u32;
 typedef   signed long long i64;
 typedef ptrdiff_t        iz;
+typedef uintptr_t        uz;
 typedef          char    byte;
 
 #define assert(c)     while (!(c)) __builtin_trap()
@@ -47,7 +49,7 @@ static void os_exit(os *, i32 code);
 
 static byte *alloc(arena *a, iz size, iz count, iz align)
 {
-    iz pad = -(ptrdiff_t)a->beg & (align - 1);
+    iz pad = -(uz)a->beg & (align - 1);
     iz avail = (a->end - a->beg) - pad;
     if (count > avail/size) {
         // Integer overflow or out of memory
