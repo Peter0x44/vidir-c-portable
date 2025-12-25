@@ -152,6 +152,23 @@ static b32 s8equals(s8 a, s8 b)
     }
     return 1;
 }
+
+// Bit array helpers (u32 elements) - for boolean tracking with reduced memory
+static iz bitarray_size(iz count)
+{
+    return ((u32)count + 31) / 32;  // Number of u32 elements needed
+}
+
+static void bitarray_set(u32 *bits, iz index)
+{
+    bits[index / 32] |= (u32)1 << (index % 32);
+}
+
+static b32 bitarray_get(u32 *bits, iz index)
+{
+    return (bits[index / 32] >> (index % 32)) & 1;
+}
+
 typedef struct pathmap pathmap;
 struct pathmap {
     pathmap *child[4];   // 4-way trie
@@ -620,8 +637,7 @@ static s8 *parse_temp_file(arena *perm, u8input *input, iz original_name_count, 
 {
     s8 *names = new(perm, s8, original_name_count);
     // Track duplicate item numbers
-    u8 *seen = new(perm, u8, original_name_count);
-    for (iz i = 0; i < original_name_count; i++) seen[i] = 0;
+    u32 *seen = new(perm, u32, bitarray_size(original_name_count));
     
     for (;;) {
         s8 line = nextline(input);
@@ -654,12 +670,12 @@ static s8 *parse_temp_file(arena *perm, u8input *input, iz original_name_count, 
         
         // Store in the array (convert to 0-based index), normalizing the path
         iz idx = (iz)(parsed_line_num - 1);
-        if (seen[idx]) {
+        if (bitarray_get(seen, idx)) {
             prints8(err, S("vidir: duplicate item number in temp file\n"));
             flush(err);
             os_exit(perm->ctx, 1);
         }
-        seen[idx] = 1;
+        bitarray_set(seen, idx);
         s8 parsed_path = {path_copy, line_copy.len};
         names[idx] = prepend_dot_slash(perm, parsed_path);
     }
@@ -779,33 +795,33 @@ static Plan compute_plan(arena *perm, s8 *oldnames, s8 *newnames, iz num_names)
         }
     }
 
-    u8 *processed = new(perm, u8, num_names);
+    u32 *processed = new(perm, u32, bitarray_size(num_names));
     for (iz i = 0; i < num_names; i++) {
-        if (processed[i]) continue;  // Already handled this file
+        if (bitarray_get(processed, i)) continue;  // Already handled this file
 
         // Handle deletes first
         if (!final_dest[i].s || final_dest[i].len == 0) {
             plan_append(perm, &plan, OP_DELETE, oldnames[i], (s8){0});
-            processed[i] = 1;
+            bitarray_set(processed, i);
             continue;
         }
 
         // Handle non-moves
         if (s8equals(oldnames[i], final_dest[i])) {
-            processed[i] = 1;
+            bitarray_set(processed, i);
             continue;
         }
 
         // Handle files with no dependencies
-        if (deps[i] == NO_DEPENDENCY || processed[deps[i]]) {
+        if (deps[i] == NO_DEPENDENCY || bitarray_get(processed, deps[i])) {
             plan_append(perm, &plan, OP_RENAME, oldnames[i], final_dest[i]);
-            processed[i] = 1;
+            bitarray_set(processed, i);
             continue;
         }
 
         // Follow dependency chain to find the end
         iz last = deps[i];
-        while (deps[last] != NO_DEPENDENCY && deps[last] != i && !processed[deps[last]]) {
+        while (deps[last] != NO_DEPENDENCY && deps[last] != i && !bitarray_get(processed, deps[last])) {
             last = deps[last];
         }
 
@@ -814,14 +830,14 @@ static Plan compute_plan(arena *perm, s8 *oldnames, s8 *newnames, iz num_names)
         if (cycle_detected) {
             // Break the cycle by stashing the starting file
             plan_append(perm, &plan, OP_STASH, oldnames[i], (s8){0});
-            processed[i] = 1;
+            bitarray_set(processed, i);
         }
 
         // Process dependency chain in execution order
         // Start from the end of the chain and work backwards to the beginning
         while (last != i) {
             plan_append(perm, &plan, OP_RENAME, oldnames[last], final_dest[last]);
-            processed[last] = 1;
+            bitarray_set(processed, last);
             last = rdeps[last];  // Move to the file waiting for this one
             if (last == NO_DEPENDENCY) break;  // Chain is broken
         }
@@ -832,7 +848,7 @@ static Plan compute_plan(arena *perm, s8 *oldnames, s8 *newnames, iz num_names)
         } else {
             // No cycle - just rename the starting file
             plan_append(perm, &plan, OP_RENAME, oldnames[i], final_dest[i]);
-            processed[i] = 1;
+            bitarray_set(processed, i);
         }
     }
 
