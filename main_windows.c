@@ -234,7 +234,7 @@ static s16 fromenv_w(arena *perm, c16 *name)
 
 static config *newconfig_(os *ctx)
 {
-    arena perm = newarena_(ctx, 1<<23);
+    arena perm = newarena_(ctx, 1<<26);
     config *conf = new(&perm, config, 1);
     conf->perm = perm;
         
