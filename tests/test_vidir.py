@@ -46,7 +46,7 @@ with open(sys.argv[1], 'w') as f:
     editor_script_unix = editor_script.replace("\\", "/")
     return f"{python_command} {editor_script_unix}"
 
-def run_vidir_test(test_name, setup_files, editor_operations, expected_files, vidir_args=None, vidir_command="vidir", python_command="python3", expected_contents=None):
+def run_vidir_test(test_name, setup_files, editor_operations, expected_files, vidir_args=None, vidir_command="vidir", python_command="python3", expected_contents=None, use_gdb=False):
     """Run a single vidir test."""
     print(f"\n=== Testing: {test_name} ===")
     
@@ -84,6 +84,10 @@ def run_vidir_test(test_name, setup_files, editor_operations, expected_files, vi
             cmd = [vidir_command] + vidir_args
         else:
             cmd = vidir_command + vidir_args
+        
+        # Wrap in gdb if requested
+        if use_gdb:
+            cmd = ["gdb", "-batch", "-ex", "run", "-ex", "bt", "-ex", "quit", "--args"] + cmd
         
         result = subprocess.run(cmd, env=env, capture_output=True, text=True)
         
@@ -144,6 +148,7 @@ def main():
     # Parse command line arguments
     vidir_command = "vidir"
     python_command = "python3"
+    use_gdb = False
     
     # Parse arguments
     args = sys.argv[1:]
@@ -153,8 +158,10 @@ def main():
             vidir_command = arg.split("=", 1)[1]
         elif arg.startswith("--python="):
             python_command = arg.split("=", 1)[1]
+        elif arg == "--gdb":
+            use_gdb = True
         else:
-            print(f"Error: Unknown argument '{arg}'. Use --vidir=command or --python=command")
+            print(f"Error: Unknown argument '{arg}'. Use --vidir=command, --python=command, or --gdb")
             return 1
     
     # Convert relative paths to absolute paths so they work from any directory
@@ -164,6 +171,9 @@ def main():
     print(f"Testing vidir command: {vidir_command}")
     
     print(f"Using Python command: {python_command}")
+    
+    if use_gdb:
+        print("Running with GDB enabled")
     
     tests_passed = 0
     tests_total = 0
@@ -176,7 +186,8 @@ def main():
         'content = content.replace("file1.txt", "renamed.txt")',
         ["renamed.txt", "file2.txt"],
         vidir_command=vidir_command,
-        python_command=python_command
+        python_command=python_command,
+        use_gdb=use_gdb
     ):
         tests_passed += 1
     
