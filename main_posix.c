@@ -306,11 +306,9 @@ static b32 os_invoke_editor(os *ctx, arena scratch)
         execvp("sh", cmd);
         
         // If execvp returns, it failed - try to print a helpful message
-        s8 msg = S("vidir: cannot execute editor: ");
-        write(2, msg.s, (size_t)msg.len);
-        write(2, ed.s, (size_t)ed.len);
-        s8 nl = S("\n");
-        write(2, nl.s, (size_t)nl.len);
+        os_write(ctx, 2, S("vidir: cannot execute editor: "));
+        os_write(ctx, 2, ed);
+        os_write(ctx, 2, S("\n"));
         _exit(127);
     }
     
