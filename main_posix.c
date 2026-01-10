@@ -83,7 +83,7 @@ static void os_write(os *ctx, i32 fd, s8 s)
     while (s.len) {
         iz written = write(actual_fd, s.s, (size_t)s.len);
         if (written < 0) {
-            return;  // Write error, silently fail
+            os_exit(ctx, 1);
         }
         s = cuthead(s, written);
     }
