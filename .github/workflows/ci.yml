@@ -1,0 +1,21 @@
+name: CI
+
+on:
+  push:
+    branches: [ main, master ]
+  pull_request:
+    branches: [ main, master ]
+
+jobs:
+  test-linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Build vidir (POSIX)
+        run: |
+          gcc -o vidir main_posix.c -std=c11 -O2 -Wall -Wextra
+      
+      - name: Run test suite
+        run: |
+          python3 tests/test_vidir.py --vidir=./vidir
