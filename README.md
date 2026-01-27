@@ -13,6 +13,7 @@ A C implementation of vidir from [moreutils](https://joeyh.name/code/moreutils/)
 ## Building
 
 ### POSIX
+```sh
 cc -o vidir main_posix.c
 ```
 
